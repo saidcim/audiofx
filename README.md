@@ -50,14 +50,21 @@ python -m audiofx check
 
 1. Copy songs into the **`songs/`** folder.
 2. Double click **`audiofx.bat`** (Windows) or run `python -m audiofx gui`.
-3. Pick songs on the left, set the effect on the right, press **Convert selected**.
+3. Pick songs on the left, set the effect on the right, press **Play preview**
+   to hear it, then **Convert selected**.
 4. Results land in **`output/`**.
 
 What the panels do:
 
+- **Preferences** (top left) - the theme: **Dark** (default), **Light**, or
+  **System default**, which hands the look back to the platform. The change is
+  applied straight away and remembered.
 - **Song list** - mirrors `songs/`, shows length, format and size, supports
   multi-select, and double click opens a file in your default player. Press
   **Refresh** after adding files.
+- **Preview** - renders a short excerpt of the selected song with the current
+  settings and plays it, so you can hear the effect before committing to a full
+  conversion. See below.
 - **Preset** - the entries from `presets.yaml`; picking one fills every control
   below. Changing anything by hand switches back to `Custom`.
 - **Effect** - slowed / sped up / reverb only / slowed + reverb.
@@ -72,6 +79,22 @@ What the panels do:
   **Cancel** button. One failing file does not stop the rest.
 
 Folder choices and your last settings are stored in `~/.audiofx-gui.json`.
+
+### Preview
+
+**Play preview** takes the selected song (or the first one in the list),
+renders **Length** seconds of it starting at **Start at (s)** with exactly the
+settings currently on screen, and plays the result. **Whole song** renders all
+of it. **Stop** ends playback, and also discards a render that is still in
+progress.
+
+Previews are uncompressed wavs in your system temp folder, not in `output/`;
+they are cleaned up when the window closes. Playback uses `ffplay`, which comes
+with ffmpeg - without it the excerpt is handed to your default player instead,
+where the Stop button cannot reach it.
+
+Because the render is a real conversion, a preview of the whole song takes as
+long as converting it. The default 20 seconds is instant.
 
 ## Quality
 
@@ -240,8 +263,9 @@ python -m pytest
 
 The tests run against `tests/fixtures/sample.wav` (a 2 second 440 Hz sine) and
 check the generated filter graphs, the output durations against the requested
-factor, and that the reverb cannot clip. Tests that need ffmpeg skip themselves
-when it is missing; the GUI tests skip when no display is available.
+factor, that the reverb cannot clip, and that both themes paint every widget.
+Tests that need ffmpeg skip themselves when it is missing; the GUI tests skip
+when no display is available.
 
 ## Credits
 

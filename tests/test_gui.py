@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from audiofx import gui
+from audiofx import gui, theme
 from audiofx.ffmpeg_runner import REVERB_SIZES
 from conftest import duration_of, ffmpeg_required
 
@@ -101,22 +101,15 @@ def test_human_helpers():
     assert gui.human_size(2048).startswith("2.0")
 
 
+def test_preview_lengths_are_positive_or_whole_song():
+    assert None in gui.PREVIEW_LENGTHS.values()
+    for length in gui.PREVIEW_LENGTHS.values():
+        assert length is None or length > 0
+
+
 # --------------------------------------------------------------------------
 # interface (only when a Tk window can be created)
 # --------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def tk_root():
-    """One hidden Tk root; creating a fresh one per test is flaky."""
-    tk = pytest.importorskip("tkinter")
-    try:
-        root = tk.Tk()
-    except tk.TclError:  # pragma: no cover - headless environment
-        pytest.skip("cannot open a Tk window")
-    root.withdraw()
-    yield root
-    root.destroy()
 
 
 @pytest.fixture()
@@ -262,6 +255,195 @@ def test_conversion_waits_for_download(app, monkeypatch):
     finally:
         release.set()
         app.download_worker.join(timeout=10)
+
+
+# --------------------------------------------------------------------------
+# theme + preferences
+# --------------------------------------------------------------------------
+
+
+def test_the_interface_starts_dark(app):
+    assert app.theme_var.get() == theme.DEFAULT_THEME
+    assert app.palette is theme.DARK
+    assert app.log.cget("background") == theme.DARK.field
+
+
+def test_preferences_window_offers_every_theme(app):
+    app.open_preferences()
+    try:
+        assert app._prefs_window is not None
+        assert list(app.theme_combo.cget("values")) == list(theme.THEME_CHOICES.values())
+        assert app.theme_combo.get() == theme.THEME_CHOICES[theme.DEFAULT_THEME]
+    finally:
+        app.close_preferences()
+
+
+def test_preferences_window_is_reused(app):
+    app.open_preferences()
+    first = app._prefs_window
+    app.open_preferences()
+    try:
+        assert app._prefs_window is first
+    finally:
+        app.close_preferences()
+    assert app._prefs_window is None
+
+
+def test_picking_a_theme_repaints_immediately(app):
+    app.open_preferences()
+    try:
+        app.theme_combo.set(theme.THEME_CHOICES["light"])
+        app._on_theme_choice()
+        assert app.theme_var.get() == "light"
+        assert app.palette is theme.LIGHT
+        assert app.log.cget("background") == theme.LIGHT.field
+    finally:
+        app.close_preferences()
+        app.apply_theme("dark")
+
+
+def test_switching_theme_repaints_the_log(app):
+    app.apply_theme("light")
+    assert app.palette is theme.LIGHT
+    assert app.log.cget("background") == theme.LIGHT.field
+    app.apply_theme("dark")
+    assert app.log.cget("background") == theme.DARK.field
+
+
+def test_unknown_theme_falls_back_instead_of_failing(app):
+    app.apply_theme("neon")
+    assert app.theme_var.get() == theme.DEFAULT_THEME
+
+
+def test_theme_survives_a_restart(app, tmp_path: Path):
+    import tkinter as tk
+
+    app.apply_theme("light")
+    app.save_settings()
+
+    window = tk.Toplevel(app.master)
+    window.withdraw()
+    reopened = gui.AudioFxApp(
+        window, app.songs_dir, app.output_dir, settings_file=app.settings_file
+    )
+    try:
+        assert reopened.theme_var.get() == "light"
+    finally:
+        reopened.stop()
+        window.destroy()
+        app.apply_theme("dark")
+
+
+# --------------------------------------------------------------------------
+# preview
+# --------------------------------------------------------------------------
+
+
+class FakePlayer:
+    def __init__(self) -> None:
+        self.played: list[Path] = []
+        self.stops = 0
+        self.playing = False
+
+    def play(self, path) -> None:
+        self.played.append(Path(path))
+        self.playing = True
+
+    def stop(self) -> None:
+        self.stops += 1
+        self.playing = False
+
+    def is_playing(self) -> bool:
+        return self.playing
+
+
+def test_preview_needs_a_song(app, monkeypatch):
+    infos = []
+    monkeypatch.setattr(gui.messagebox, "showinfo", lambda *args: infos.append(args))
+    app.songs = []
+    app.tree.delete(*app.tree.get_children())
+    app.preview_selected()
+    assert infos and app.preview_worker is None
+
+
+def test_preview_ready_plays_the_render(app, tmp_path: Path):
+    app.player = FakePlayer()
+    app._preview_name = "song.wav"
+    rendered = gui.preview.preview_dir() / "preview_x.wav"
+    rendered.write_bytes(b"x")
+
+    app._preview_ready(app._preview_token, rendered, None)
+
+    assert app.player.played == [rendered]
+    assert "Playing preview" in app.status_var.get()
+    assert str(app.preview_stop_button.cget("state")) == "normal"
+
+
+def test_stopped_preview_is_not_played_when_it_arrives(app):
+    app.player = FakePlayer()
+    stale = app._preview_token
+    app.stop_preview()  # the user pressed Stop while it was still rendering
+
+    rendered = gui.preview.preview_dir() / "preview_x.wav"
+    rendered.write_bytes(b"x")
+    app._preview_ready(stale, rendered, None)
+
+    assert app.player.played == []
+    assert not rendered.exists(), "a discarded render should not be left behind"
+
+
+def test_preview_failure_is_reported(app, monkeypatch):
+    errors = []
+    monkeypatch.setattr(gui.messagebox, "showerror", lambda *args: errors.append(args))
+    app.player = FakePlayer()
+
+    app._preview_ready(app._preview_token, None, "ffmpeg exited with code 1")
+
+    assert errors and "ffmpeg" in errors[0][1]
+    assert str(app.preview_button.cget("state")) == "normal"
+
+
+def test_missing_ffplay_falls_back_to_the_default_player(app, monkeypatch, tmp_path: Path):
+    opened = []
+    monkeypatch.setattr(gui, "open_file", lambda path: opened.append(path))
+
+    class NoPlayer(FakePlayer):
+        def play(self, path):
+            raise gui.preview.PlayerNotFoundError("ffplay was not found")
+
+    app.player = NoPlayer()
+    rendered = tmp_path / "preview.wav"
+    rendered.write_bytes(b"x")
+    app._preview_ready(app._preview_token, rendered, None)
+
+    assert opened == [rendered]
+    assert "default player" in app.status_var.get()
+
+
+def test_starting_a_conversion_stops_the_preview(app, monkeypatch):
+    app.player = FakePlayer()
+    app.player.playing = True
+    monkeypatch.setattr(gui.AudioFxApp, "_run_jobs", lambda *args: None)
+
+    app.select_all()
+    app.convert_selected()
+    app.worker.join(timeout=5)
+
+    assert app.player.stops >= 1
+
+
+@ffmpeg_required
+def test_run_preview_renders_an_excerpt(app, tmp_path: Path):
+    options = make_options(tmp_path, mode="slow", factor=0.5)
+    app._run_preview(app.songs[0], options, 0.0, 1.0, app._preview_token)
+
+    # the song list probes in the background, so the queue holds other messages
+    messages = [m for m in list(app.queue.queue) if m[0] == "preview_finished"]
+    assert len(messages) == 1
+    _kind, token, path, error = messages[0]
+    assert error is None
+    assert token == app._preview_token
+    assert duration_of(path) == pytest.approx(1.0, rel=0.1)
 
 
 @ffmpeg_required

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import downloader
+from . import downloader, preview, theme
 from .ffmpeg_runner import (
     AUDIO_EXTENSIONS,
     LOSSY_EXTENSIONS,
@@ -60,6 +60,14 @@ ROOM_CHOICES: dict[str, str] = {
 }
 
 CUSTOM_PRESET = "Custom"
+
+# label -> preview length in seconds; None renders the whole track
+PREVIEW_LENGTHS: dict[str, float | None] = {
+    "10 seconds": 10.0,
+    "20 seconds": 20.0,
+    "30 seconds": 30.0,
+    "Whole song": None,
+}
 
 # mode -> (min, max) speed range
 SPEED_RANGE = {
@@ -173,7 +181,7 @@ class AudioFxApp(ttk.Frame):
         output_dir: Path | str | None = None,
         settings_file: Path | str | None = None,
     ) -> None:
-        super().__init__(master, padding=10)
+        super().__init__(master, padding=8)
         self.master: tk.Tk = master
         root = workspace_root()
         # folders passed in explicitly win over whatever was saved last time
@@ -191,6 +199,16 @@ class AudioFxApp(ttk.Frame):
         self.download_cancel = threading.Event()
         self._loading_preset = False
 
+        self.player = preview.Player()
+        self.preview_worker: threading.Thread | None = None
+        # bumped on every request; a render whose token is stale is discarded
+        # instead of played, which is what makes "Stop" work mid-render
+        self._preview_token = 0
+        self._preview_playing = False
+        self._preview_name = ""
+        self.palette = theme.palette_for(theme.DEFAULT_THEME)
+        self._prefs_window: tk.Toplevel | None = None
+
         try:
             self.presets = load_presets()
         except Exception as exc:  # pragma: no cover - broken yaml
@@ -199,10 +217,77 @@ class AudioFxApp(ttk.Frame):
         ir_dir = Path(__file__).parent / "assets" / "ir"
         self.ir_file = ir_dir / "hall_large.wav"
 
+        self.theme_var = tk.StringVar(value=theme.DEFAULT_THEME)
         self._build_ui()
         self._load_settings()
+        self.apply_theme()
+        preview.clear_previews()
         self.refresh_songs()
         self._after_id: str | None = self.after(120, self._drain_queue)
+
+    # ------------------------------------------------------------------
+    # preferences menu + theme
+    # ------------------------------------------------------------------
+
+    def open_preferences(self) -> None:
+        """Small settings window, opened from the top left corner.
+
+        A menu bar (or a dropdown menu) is drawn by Windows in the system
+        colours and would sit there as a white slab on top of a dark window;
+        an ordinary Toplevel full of ttk widgets follows the palette.
+        """
+        if self._prefs_window is not None and self._prefs_window.winfo_exists():
+            self._prefs_window.deiconify()
+            self._prefs_window.lift()
+            return
+
+        window = tk.Toplevel(self.master)
+        self._prefs_window = window
+        window.title("Preferences")
+        window.transient(self.master)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.close_preferences)
+
+        box = ttk.Frame(window, padding=12)
+        box.grid(sticky="nsew")
+        ttk.Label(box, text="Theme:").grid(row=0, column=0, sticky="w")
+        self.theme_combo = ttk.Combobox(
+            box,
+            state="readonly",
+            width=16,
+            values=list(theme.THEME_CHOICES.values()),
+        )
+        self.theme_combo.set(theme.THEME_CHOICES[theme.normalize(self.theme_var.get())])
+        self.theme_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.theme_combo.bind("<<ComboboxSelected>>", self._on_theme_choice)
+
+        ttk.Label(
+            box,
+            text="Applied straight away and remembered for next time.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(box, text="Close", command=self.close_preferences).grid(
+            row=2, column=1, sticky="e", pady=(14, 0)
+        )
+        self.apply_theme()
+
+    def close_preferences(self) -> None:
+        if self._prefs_window is not None:
+            if self._prefs_window.winfo_exists():
+                self._prefs_window.destroy()
+            self._prefs_window = None
+
+    def _on_theme_choice(self, _event=None) -> None:
+        self.apply_theme(theme.value_for_label(self.theme_combo.get()))
+
+    def apply_theme(self, name: str | None = None) -> None:
+        """Repaint the interface; called from the Preferences window."""
+        if name is not None:
+            self.theme_var.set(theme.normalize(name))
+        self.palette = theme.apply_theme(self, self.theme_var.get())
+        self.log.configure(**theme.text_options(self.palette))
+        if self._prefs_window is not None and self._prefs_window.winfo_exists():
+            self._prefs_window.configure(background=self.palette.window)
 
     # ------------------------------------------------------------------
     # layout
@@ -219,17 +304,20 @@ class AudioFxApp(ttk.Frame):
         # --- top bar: songs folder ---
         top = ttk.Frame(self)
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="Songs folder:").grid(row=0, column=0, padx=(0, 6))
+        top.columnconfigure(2, weight=1)
+        ttk.Button(top, text="Preferences", command=self.open_preferences).grid(
+            row=0, column=0, padx=(0, 12)
+        )
+        ttk.Label(top, text="Songs folder:").grid(row=0, column=1, padx=(0, 6))
         self.songs_var = tk.StringVar(value=str(self.songs_dir))
         ttk.Entry(top, textvariable=self.songs_var, state="readonly").grid(
-            row=0, column=1, sticky="ew"
+            row=0, column=2, sticky="ew"
         )
-        ttk.Button(top, text="Change", command=self.choose_songs_dir).grid(row=0, column=2, padx=4)
+        ttk.Button(top, text="Change", command=self.choose_songs_dir).grid(row=0, column=3, padx=4)
         ttk.Button(top, text="Open folder", command=lambda: open_folder(self.songs_dir)).grid(
-            row=0, column=3
+            row=0, column=4
         )
-        ttk.Button(top, text="Refresh", command=self.refresh_songs).grid(row=0, column=4, padx=4)
+        ttk.Button(top, text="Refresh", command=self.refresh_songs).grid(row=0, column=5, padx=4)
 
         # --- optional spotdl download box ---
         download_box = ttk.LabelFrame(self, text="Download with spotdl (optional)", padding=6)
@@ -256,7 +344,7 @@ class AudioFxApp(ttk.Frame):
             download_box,
             text="Runs spotdl and saves into the songs folder. Only use it for material "
             "you have the rights to.",
-            foreground="#666",
+            style="Hint.TLabel",
             justify="left",
         )
         self.download_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -266,7 +354,7 @@ class AudioFxApp(ttk.Frame):
             self.url_entry.configure(state="disabled")
             self.download_hint.configure(
                 text="spotdl is not installed. Install it with: pip install spotdl",
-                foreground="#a33",
+                style="Warn.TLabel",
             )
 
         # --- left: song list ---
@@ -303,6 +391,48 @@ class AudioFxApp(ttk.Frame):
         ).pack(side="left")
         ttk.Button(list_bar, text="Select all", command=self.select_all).pack(side="right")
 
+        # --- preview: under the list, because it works on the selected song ---
+        preview_box = ttk.LabelFrame(left, text="Preview", padding=6)
+        preview_box.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        preview_box.columnconfigure(6, weight=1)
+
+        self.preview_button = ttk.Button(
+            preview_box, text="Play preview", command=self.preview_selected
+        )
+        self.preview_button.grid(row=0, column=0, sticky="w")
+        self.preview_stop_button = ttk.Button(
+            preview_box, text="Stop", command=self.stop_preview, state="disabled", width=8
+        )
+        self.preview_stop_button.grid(row=0, column=1, padx=(6, 12))
+
+        ttk.Label(preview_box, text="Length:").grid(row=0, column=2)
+        self.preview_length_var = tk.StringVar(value="20 seconds")
+        ttk.Combobox(
+            preview_box,
+            textvariable=self.preview_length_var,
+            state="readonly",
+            values=list(PREVIEW_LENGTHS),
+            width=12,
+        ).grid(row=0, column=3, padx=(6, 12))
+        ttk.Label(preview_box, text="Start at (s):").grid(row=0, column=4)
+        self.preview_start_var = tk.DoubleVar(value=preview.DEFAULT_START)
+        ttk.Spinbox(
+            preview_box,
+            from_=0,
+            to=3600,
+            increment=5,
+            width=6,
+            textvariable=self.preview_start_var,
+        ).grid(row=0, column=5, padx=(6, 0))
+
+        ttk.Label(
+            preview_box,
+            text="Plays an excerpt of the selected song with the current settings; "
+            "nothing is written to the output folder.",
+            style="Hint.TLabel",
+            justify="left",
+        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+
         # --- right: settings ---
         right = ttk.Frame(self)
         right.grid(row=2, column=1, sticky="nsew")
@@ -323,7 +453,7 @@ class AudioFxApp(ttk.Frame):
         self.preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
 
         effect_box = ttk.LabelFrame(right, text="Effect", padding=6)
-        effect_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        effect_box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         effect_box.columnconfigure(0, weight=1)
         self.mode_var = tk.StringVar(value="slowed_reverb")
         for index, (value, label) in enumerate(MODES):
@@ -336,7 +466,7 @@ class AudioFxApp(ttk.Frame):
             ).grid(row=index, column=0, sticky="w")
 
         speed_box = ttk.LabelFrame(right, text="Speed", padding=6)
-        speed_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        speed_box.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         speed_box.columnconfigure(0, weight=1)
         self.factor_var = tk.DoubleVar(value=0.85)
         self.speed_scale = ttk.Scale(
@@ -379,7 +509,7 @@ class AudioFxApp(ttk.Frame):
         ).pack(side="left", padx=6)
 
         self.reverb_box = ttk.LabelFrame(right, text="Reverb", padding=6)
-        self.reverb_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self.reverb_box.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         self.reverb_box.columnconfigure(1, weight=1)
 
         ttk.Label(self.reverb_box, text="Room:").grid(row=0, column=0, sticky="w")
@@ -422,14 +552,13 @@ class AudioFxApp(ttk.Frame):
         self.bass_cut_spin.grid(row=3, column=1, sticky="w", padx=(6, 0))
         ttk.Label(
             self.reverb_box,
-            text="Keeps the low end out of the reverb tail. Raise it if the\n"
-            "result sounds boomy or bass-boosted; 0 turns it off.",
-            foreground="#666",
+            text="Keeps the low end out of the tail; raise it if it sounds boomy.",
+            style="Hint.TLabel",
             justify="left",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         out_box = ttk.LabelFrame(right, text="Output", padding=6)
-        out_box.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        out_box.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         out_box.columnconfigure(0, weight=1)
         self.quality_var = tk.StringVar(value=next(iter(QUALITY_CHOICES)))
         ttk.Combobox(
@@ -440,8 +569,8 @@ class AudioFxApp(ttk.Frame):
         ).grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             out_box,
-            text="MP3 -> MP3 always loses a little quality;\npick FLAC if you want none of that.",
-            foreground="#666",
+            text="MP3 -> MP3 loses a little quality; pick FLAC to keep all of it.",
+            style="Hint.TLabel",
             justify="left",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 4))
         self.tags_var = tk.BooleanVar(value=True)
@@ -488,7 +617,9 @@ class AudioFxApp(ttk.Frame):
         log_frame.grid(row=2, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        self.log = tk.Text(log_frame, height=6, state="disabled", wrap="none")
+        # deliberately short: row 2 carries the grid weight, so every pixel the
+        # log does not claim goes to the song list instead
+        self.log = tk.Text(log_frame, height=3, state="disabled", wrap="none")
         self.log.grid(row=0, column=0, sticky="nsew")
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
         log_scroll.grid(row=0, column=1, sticky="ns")
@@ -528,6 +659,12 @@ class AudioFxApp(ttk.Frame):
             self.mix_var.set(float(data["reverb_mix"]))
         if isinstance(data.get("reverb_bass_cut"), (int, float)):
             self.bass_cut_var.set(float(data["reverb_bass_cut"]))
+        if data.get("theme") in theme.THEME_CHOICES:
+            self.theme_var.set(data["theme"])
+        if data.get("preview_length") in PREVIEW_LENGTHS:
+            self.preview_length_var.set(data["preview_length"])
+        if isinstance(data.get("preview_start"), (int, float)):
+            self.preview_start_var.set(float(data["preview_start"]))
         self.preserve_var.set(bool(data.get("preserve_pitch", False)))
         self.recursive_var.set(bool(data.get("recursive", False)))
         self._on_mode_change()
@@ -545,6 +682,9 @@ class AudioFxApp(ttk.Frame):
             "reverb_bass_cut": round(float(self.bass_cut_var.get()), 1),
             "preserve_pitch": bool(self.preserve_var.get()),
             "recursive": bool(self.recursive_var.get()),
+            "theme": theme.normalize(self.theme_var.get()),
+            "preview_length": self.preview_length_var.get(),
+            "preview_start": round(float(self.preview_start_var.get()), 1),
         }
         try:
             self.settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -782,6 +922,128 @@ class AudioFxApp(ttk.Frame):
         self.queue.put(("download_finished", downloader.summarize(new_files), None))
 
     # ------------------------------------------------------------------
+    # preview
+    # ------------------------------------------------------------------
+
+    def _preview_song(self) -> Song | None:
+        """What to preview: the first selected file, else the first listed."""
+        selected = self._selected_songs()
+        if selected:
+            return selected[0]
+        return self.songs[0] if self.songs else None
+
+    def _preview_start(self) -> float:
+        try:
+            return float(self.preview_start_var.get())
+        except (tk.TclError, ValueError):
+            return preview.DEFAULT_START
+
+    def preview_selected(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(
+                "Conversion in progress", "Wait for the conversion to finish first."
+            )
+            return
+        if self.preview_worker and self.preview_worker.is_alive():
+            return
+        song = self._preview_song()
+        if song is None:
+            messagebox.showinfo(
+                "Nothing to preview", "Add some files to the songs folder first."
+            )
+            return
+
+        options = self._current_options()
+        if options.reverb_room == "hall" and options.ir_file is None:
+            options.reverb_room = "large"
+        length = PREVIEW_LENGTHS.get(self.preview_length_var.get(), preview.DEFAULT_LENGTH)
+        total = song.info.duration if song.info else None
+        start = preview.clamp_start(self._preview_start(), total, length)
+
+        self.player.stop()
+        self._preview_token += 1
+        self._preview_name = song.path.name
+        self.preview_button.configure(state="disabled")
+        self.preview_stop_button.configure(state="normal")
+        self.status_var.set(f"Rendering preview: {song.path.name}")
+
+        self.preview_worker = threading.Thread(
+            target=self._run_preview,
+            args=(song, options, start, length, self._preview_token),
+            daemon=True,
+        )
+        self.preview_worker.start()
+
+    def stop_preview(self) -> None:
+        # bumping the token discards a render that is still running, so
+        # pressing Stop during the render does not end in sudden playback
+        self._preview_token += 1
+        self.player.stop()
+        self._preview_playing = False
+        self.preview_button.configure(state="normal")
+        self.preview_stop_button.configure(state="disabled")
+        if self.status_var.get().startswith(("Playing preview", "Rendering preview")):
+            self.status_var.set("Preview stopped.")
+
+    def _run_preview(
+        self,
+        song: Song,
+        options: JobOptions,
+        start: float,
+        length: float | None,
+        token: int,
+    ) -> None:
+        try:
+            path = preview.render(
+                song.path, options.build_spec(), start=start, length=length
+            )
+        except Exception as exc:
+            self.queue.put(("preview_finished", token, None, str(exc)))
+            return
+        self.queue.put(("preview_finished", token, path, None))
+
+    def _preview_ready(self, token: int, path: Path | None, error: str | None) -> None:
+        self.preview_button.configure(state="normal")
+        if token != self._preview_token:  # stopped while it was rendering
+            preview.clear_previews()
+            return
+        if error is not None:
+            self.preview_stop_button.configure(state="disabled")
+            self.status_var.set("Preview failed.")
+            self._log(f"[ERROR] preview: {error}")
+            messagebox.showerror("Preview failed", error)
+            return
+
+        assert path is not None
+        preview.clear_previews(keep=path)
+        try:
+            self.player.play(path)
+        except preview.PlayerNotFoundError as exc:
+            self.preview_stop_button.configure(state="disabled")
+            self._log(f"    {exc}")
+            try:
+                open_file(path)
+            except Exception as failure:  # pragma: no cover - platform specific
+                messagebox.showwarning("Could not play", str(failure))
+                return
+            self.status_var.set("Preview opened in the default player.")
+            return
+
+        self._preview_playing = True
+        self.preview_stop_button.configure(state="normal")
+        self.status_var.set(f"Playing preview: {self._preview_name}")
+
+    def _poll_player(self) -> None:
+        """Notice when ffplay reached the end of the excerpt on its own."""
+        playing = self.player.is_playing()
+        if playing == self._preview_playing:
+            return
+        self._preview_playing = playing
+        self.preview_stop_button.configure(state="normal" if playing else "disabled")
+        if not playing and self.status_var.get().startswith("Playing preview"):
+            self.status_var.set("Preview finished.")
+
+    # ------------------------------------------------------------------
     # conversion
     # ------------------------------------------------------------------
 
@@ -821,6 +1083,8 @@ class AudioFxApp(ttk.Frame):
         if self._download_running():
             messagebox.showinfo("Download in progress", "Wait for the download to finish first.")
             return
+        # a preview playing over the conversion only confuses the status line
+        self.stop_preview()
         options = self._current_options()
         if options.reverb_room == "hall" and options.ir_file is None:
             messagebox.showwarning(
@@ -931,6 +1195,8 @@ class AudioFxApp(ttk.Frame):
                         self.url_var.set("")
                         self.refresh_songs()  # writes its own status text
                         self.status_var.set(summary)
+                elif kind == "preview_finished":
+                    self._preview_ready(message[1], message[2], message[3])
                 elif kind == "finished":
                     done, failed = message[1], message[2]
                     self.status_var.set(
@@ -941,12 +1207,16 @@ class AudioFxApp(ttk.Frame):
                     self.cancel_button.configure(state="disabled")
         except queue.Empty:
             pass
+        self._poll_player()
         self._after_id = self.after(120, self._drain_queue)
 
     def stop(self) -> None:
         """Stop running work and cancel the pending timer."""
         self.cancel_event.set()
         self.download_cancel.set()
+        self._preview_token += 1
+        self.player.stop()
+        self.close_preferences()
         if self._after_id is not None:
             try:
                 self.after_cancel(self._after_id)
@@ -956,6 +1226,7 @@ class AudioFxApp(ttk.Frame):
 
     def on_close(self) -> None:
         self.stop()
+        preview.clear_previews()
         self.save_settings()
         self.master.destroy()
 
@@ -964,8 +1235,12 @@ def launch(songs_dir: str | Path | None = None, output_dir: str | Path | None = 
     """Open the interface. The return value is the process exit code."""
     window = tk.Tk()
     window.title("audiofx - slowed / sped up / reverb")
-    window.geometry("1060x980")
-    window.minsize(900, 780)
+    # the full layout wants ~960 px; on a shorter screen give it what there is
+    # rather than letting Windows push the bottom of the window off the desktop
+    height = min(980, window.winfo_screenheight() - 110)
+    width = min(1060, window.winfo_screenwidth() - 80)
+    window.geometry(f"{width}x{height}+40+15")
+    window.minsize(880, 620)
 
     try:
         ensure_tools()

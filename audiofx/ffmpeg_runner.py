@@ -11,10 +11,19 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
+
+# Windows opens a console window for every child process unless it is told not
+# to. The interface probes one file per song on startup, so without this the
+# user gets a burst of black rectangles flashing across the screen.
+if sys.platform == "win32":  # pragma: no cover - platform specific
+    NO_WINDOW: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
+else:  # pragma: no cover - platform specific
+    NO_WINDOW = {}
 
 # atempo only accepts factors inside this range; anything else must be chained.
 ATEMPO_MIN = 0.5
@@ -92,6 +101,7 @@ def available_filters(ffmpeg: str | None = None) -> frozenset[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **NO_WINDOW,
     )
     names: set[str] = set()
     for line in proc.stdout.splitlines():
@@ -116,6 +126,7 @@ def has_soxr(ffmpeg: str | None = None) -> bool:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **NO_WINDOW,
     )
     return "--enable-libsoxr" in f"{proc.stdout}{proc.stderr}"
 
@@ -161,7 +172,7 @@ def probe(path: Path | str, ffprobe: str | None = None) -> AudioInfo:
         str(path),
     ]
     proc = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **NO_WINDOW
     )
     if proc.returncode != 0:
         raise FFmpegError(f"Could not read file: {path}\n{summarize_stderr(proc.stderr)}")
@@ -533,8 +544,15 @@ def build_command(
     overwrite: bool = True,
     bitrate: str | None = None,
     resampler: str | None = None,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> list[str]:
-    """Assemble the ffmpeg argv for one conversion."""
+    """Assemble the ffmpeg argv for one conversion.
+
+    `start` and `duration` cut an excerpt out of the source; they exist for the
+    preview, which renders a few seconds instead of the whole track. `-t`
+    limits the *output*, so the excerpt lasts that long after the tempo change.
+    """
     info = info or AudioInfo()
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -543,11 +561,17 @@ def build_command(
 
     cmd: list[str] = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error"]
     cmd.append("-y" if overwrite else "-n")
+    if start:
+        # before -i: ffmpeg seeks instead of decoding and discarding
+        cmd += ["-ss", _fmt(float(start))]
     cmd += ["-i", str(input_path)]
     for extra in plan.extra_inputs:
+        # the impulse response is a second input and must never be seeked
         cmd += ["-i", str(extra)]
 
     cmd += plan.args
+    if duration:
+        cmd += ["-t", _fmt(float(duration))]
     cmd += ["-map_metadata", "0"]
 
     target_bitrate = bitrate
@@ -577,6 +601,7 @@ def run_ffmpeg(cmd: Sequence[str]) -> str:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **NO_WINDOW,
         )
     except FileNotFoundError as exc:  # ffmpeg vanished between check and run
         raise FFmpegNotFoundError(str(exc)) from exc
@@ -608,9 +633,15 @@ def convert_file(
     bitrate: str | None = None,
     resampler: str = "auto",
     dry_run: bool = False,
+    start: float | None = None,
+    duration: float | None = None,
 ) -> ConversionResult:
     """Probe, build and run a single conversion."""
     spec.validate()
+    if start is not None and start < 0:
+        raise ValueError("start must not be negative")
+    if duration is not None and duration <= 0:
+        raise ValueError("duration must be positive")
     ffmpeg, ffprobe = ensure_tools()
 
     input_path = Path(input_path)
@@ -636,6 +667,8 @@ def convert_file(
         overwrite=overwrite,
         bitrate=bitrate,
         resampler=resolved_resampler,
+        start=start,
+        duration=duration,
     )
 
     result = ConversionResult(

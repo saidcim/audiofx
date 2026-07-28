@@ -23,6 +23,34 @@ def sample_wav() -> Path:
     return path
 
 
+@pytest.fixture(scope="session")
+def tk_root():
+    """One hidden Tk root; creating a fresh one per test is flaky."""
+    tk = pytest.importorskip("tkinter")
+    try:
+        root = tk.Tk()
+    except tk.TclError:  # pragma: no cover - headless environment
+        pytest.skip("cannot open a Tk window")
+    root.withdraw()
+    yield root
+    root.destroy()
+
+
+@pytest.fixture(autouse=True)
+def preview_tmpdir(tmp_path: Path, monkeypatch):
+    """Keep rendered previews out of the real temp folder.
+
+    Without this the tests would delete the previews of an audiofx window the
+    user has open at the same time.
+    """
+    from audiofx import preview
+
+    folder = tmp_path / "preview-temp"
+    folder.mkdir()
+    monkeypatch.setattr(preview, "gettempdir", lambda: str(folder))
+    return preview.preview_dir()
+
+
 @pytest.fixture()
 def workdir(tmp_path: Path, sample_wav: Path) -> Path:
     """A temp folder holding one copy of the sample file."""

@@ -275,6 +275,47 @@ def test_build_command_no_bitrate_for_lossless(tmp_path: Path):
     assert "-b:a" not in cmd
 
 
+def test_build_command_has_no_excerpt_options_by_default(tmp_path: Path):
+    cmd = fr.build_command(tmp_path / "in.wav", tmp_path / "out.wav", fr.FxSpec())
+    assert "-ss" not in cmd and "-t" not in cmd
+
+
+def test_build_command_seeks_before_the_input(tmp_path: Path):
+    cmd = fr.build_command(
+        tmp_path / "in.mp3",
+        tmp_path / "out.wav",
+        fr.FxSpec(tempo=0.85),
+        start=12.5,
+        duration=20,
+    )
+    # -ss must come first: after -i it decodes and throws away everything
+    assert cmd.index("-ss") < cmd.index("-i")
+    assert cmd[cmd.index("-ss") + 1] == "12.5"
+    assert cmd[cmd.index("-t") + 1] == "20"
+
+
+def test_excerpt_never_seeks_the_impulse_response(tmp_path: Path):
+    ir = tmp_path / "ir.wav"
+    ir.write_bytes(b"RIFF")
+    spec = fr.FxSpec(tempo=0.9, reverb=fr.ReverbSettings(ir_file=ir))
+    cmd = fr.build_command(tmp_path / "in.wav", tmp_path / "out.wav", spec, start=5)
+    assert cmd.count("-ss") == 1
+    assert cmd[cmd.index("-ss") + 1 : cmd.index("-ss") + 4] == [
+        "5",
+        "-i",
+        str(tmp_path / "in.wav"),
+    ]
+
+
+@ffmpeg_required
+def test_excerpt_length_follows_the_requested_duration(workdir: Path, tmp_path: Path):
+    target = tmp_path / "excerpt.wav"
+    fr.convert_file(
+        workdir / "song.wav", target, fr.FxSpec(tempo=0.5), start=0.5, duration=1.0
+    )
+    assert duration_of(target) == pytest.approx(1.0, rel=0.1)
+
+
 def test_missing_binary_message_is_actionable(monkeypatch):
     monkeypatch.setattr(fr.shutil, "which", lambda name: None)
     with pytest.raises(fr.FFmpegNotFoundError) as excinfo:

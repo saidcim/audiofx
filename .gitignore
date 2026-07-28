@@ -24,3 +24,6 @@ output/*
 
 # Local GUI settings
 .audiofx-gui.json
+
+# Session handover notes (Turkish, internal). Delete this line to publish it.
+LAST_SESSION.md
