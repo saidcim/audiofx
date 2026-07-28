@@ -1,0 +1,86 @@
+# audiofx preset definitions
+#
+# Keys a preset may use:
+#   description    : shown by `audiofx presets list`
+#   mode           : slow | speed | reverb | slowed_reverb
+#   factor         : tempo multiplier (0.85 -> 15% slower, 1.25 -> 25% faster)
+#   pitch_shift    : pitch offset in semitones (e.g. -2, +3.5)
+#   preserve_pitch : true keeps the pitch while the tempo changes
+#   engine         : auto | classic | rubberband
+#   reverb         : size / delays / decays / mix / highpass / lowpass / ir_file
+#
+# About the reverb block:
+#   size     small | medium | large - picks a ready-made tap layout
+#   delays   tap delays in ms (overrides `size`); 4+ taps are split into two
+#            chained aecho stages, which multiply into a denser tail
+#   decays   gain of each tap, 0-1, same length as delays
+#   mix      how much of the tail is mixed back in (0.35 = subtle, 0.6 = wet)
+#   highpass Hz below which the tail is removed. This is what keeps the result
+#            from sounding bass-boosted: low frequencies stay in the dry signal
+#            only, so nothing piles up and clips.
+#   lowpass  Hz above which the tail is damped, like a real room absorbing highs
+#   ir_file  wav impulse response for convolution reverb (afir) instead of taps
+#
+# CLI flags always override preset values.
+
+presets:
+  default:
+    description: "Classic slowed + reverb (the usual starting point)"
+    mode: slowed_reverb
+    factor: 0.85
+    reverb:
+      size: medium
+      mix: 0.35
+      highpass: 200
+      lowpass: 7000
+
+  slowed:
+    description: "Slow down only; pitch drops with the tempo (classic slowed)"
+    mode: slow
+    factor: 0.85
+
+  deep_slowed:
+    description: "Heavier slowdown with a noticeably lower pitch"
+    mode: slow
+    factor: 0.75
+
+  dreamy:
+    description: "Heavy slowdown plus a long, wide reverb tail"
+    mode: slowed_reverb
+    factor: 0.8
+    reverb:
+      size: large
+      mix: 0.5
+      highpass: 240
+      lowpass: 6000
+
+  nightcore:
+    description: "Sped up and pitched up (nightcore)"
+    mode: speed
+    factor: 1.25
+
+  sped_up:
+    description: "Slightly faster, pitch stays where it is"
+    mode: speed
+    factor: 1.15
+    preserve_pitch: true
+
+  reverb_room:
+    description: "Small room reverb, tempo untouched"
+    mode: reverb
+    factor: 1.0
+    reverb:
+      size: small
+      mix: 0.28
+      highpass: 180
+      lowpass: 8000
+
+  reverb_hall:
+    description: "Large hall via IR convolution (afir)"
+    mode: reverb
+    factor: 1.0
+    reverb:
+      ir_file: assets/ir/hall_large.wav
+      mix: 0.35
+      highpass: 220
+      lowpass: 7000

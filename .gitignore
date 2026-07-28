@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local audio: never commit material you do not own the rights to
+songs/*
+!songs/README.md
+output/*
+!output/.gitkeep
+
+# Local GUI settings
+.audiofx-gui.json

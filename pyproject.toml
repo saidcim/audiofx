@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiofx"
+version = "0.1.0"
+description = "ffmpeg ile slowed / sped up / reverb ses versiyonlari ureten CLI araci"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0", "mutagen>=1.47"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+audiofx = "audiofx.cli:main"
+
+[tool.setuptools]
+packages = ["audiofx"]
+
+[tool.setuptools.package-data]
+audiofx = ["presets.yaml", "assets/ir/*.wav"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
