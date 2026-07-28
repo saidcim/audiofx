@@ -12,7 +12,7 @@ from .ffmpeg_runner import (
     AUDIO_EXTENSIONS,
     ENGINES,
     RESAMPLERS,
-    REVERB_SIZES,
+    REVERB_ROOMS,
     ConversionResult,
     FFmpegError,
     FxSpec,
@@ -21,7 +21,7 @@ from .ffmpeg_runner import (
     ensure_tools,
 )
 from .metadata import copy_metadata
-from .presets import MODES, PresetError, get_preset, load_presets
+from .presets import MODES, PresetError, combined_presets, get_preset, load_presets
 
 MODE_DEFAULT_FACTOR = {
     "slow": 0.85,
@@ -79,9 +79,12 @@ def resolve_spec(args: argparse.Namespace) -> tuple[FxSpec, str, str | None]:
     reverb: ReverbSettings | None = None
     if mode in ("reverb", "slowed_reverb"):
         reverb = (preset.reverb if preset and preset.reverb else None) or ReverbSettings()
-        if args.reverb_size:
-            delays, decays = REVERB_SIZES[args.reverb_size]
-            reverb = replace(reverb, delays=delays, decays=decays, ir_file=None)
+        if args.reverb_room:
+            reverb = replace(reverb, decay=REVERB_ROOMS[args.reverb_room], ir_file=None)
+        if args.reverb_decay is not None:
+            reverb = replace(reverb, decay=args.reverb_decay, ir_file=None)
+        if args.reverb_predelay is not None:
+            reverb = replace(reverb, predelay=args.reverb_predelay)
         if args.reverb_mix is not None:
             reverb = replace(reverb, mix=args.reverb_mix)
         if args.reverb_bass_cut is not None:
@@ -100,6 +103,16 @@ def resolve_spec(args: argparse.Namespace) -> tuple[FxSpec, str, str | None]:
         preserve_pitch=preserve_pitch,
         reverb=reverb,
         engine=engine,
+        bass_gain=args.bass if args.bass is not None else (preset.bass if preset else 0.0),
+        treble_gain=(
+            args.treble if args.treble is not None else (preset.treble if preset else 0.0)
+        ),
+        stereo_width=(
+            args.stereo_width
+            if args.stereo_width is not None
+            else (preset.stereo_width if preset else 1.0)
+        ),
+        normalize=args.normalize or bool(preset and preset.normalize),
     )
     try:
         spec.validate()
@@ -224,7 +237,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
 
 
 def cmd_presets(args: argparse.Namespace) -> int:
-    presets = load_presets(args.presets_file)
+    presets = load_presets(args.presets_file) if args.presets_file else combined_presets()
 
     if args.presets_command == "list":
         if not presets:
@@ -250,14 +263,24 @@ def cmd_presets(args: argparse.Namespace) -> int:
         print(f"  pitch shift   : {preset.pitch_shift:+g} semitones")
     print(f"  preserve pitch: {'yes' if preset.preserve_pitch else 'no'}")
     print(f"  engine        : {preset.engine}")
+    for label, value in (
+        ("bass", f"{preset.bass:+g} dB" if preset.bass else None),
+        ("treble", f"{preset.treble:+g} dB" if preset.treble else None),
+        ("stereo width", f"{preset.stereo_width:g}" if preset.stereo_width != 1.0 else None),
+        ("normalize", "yes" if preset.normalize else None),
+    ):
+        if value is not None:
+            print(f"  {label:<14}: {value}")
+
     if preset.reverb is not None:
         reverb = preset.reverb
         if reverb.ir_file:
             print(f"  reverb        : IR convolution -> {reverb.ir_file}")
         else:
-            delays = "|".join(f"{d:g}" for d in reverb.delays)
-            decays = "|".join(f"{d:g}" for d in reverb.decays)
-            print(f"  reverb        : taps {delays} ms / gains {decays}")
+            print(
+                f"  reverb        : {reverb.decay:g} s decay"
+                f"{f', {reverb.predelay:g} ms pre-delay' if reverb.predelay else ''}"
+            )
         print(
             f"  reverb mix    : {reverb.mix:g}"
             f"  (bass cut {reverb.highpass:g} Hz, damping {reverb.lowpass:g} Hz)"
@@ -332,9 +355,23 @@ def _add_fx_arguments(parser: argparse.ArgumentParser) -> None:
         help="time/pitch engine (default: auto)",
     )
     parser.add_argument(
+        "--reverb-room",
         "--reverb-size",
-        choices=tuple(REVERB_SIZES),
-        help="reverb tap layout: small, medium or large",
+        dest="reverb_room",
+        choices=tuple(REVERB_ROOMS),
+        help="room size: %(choices)s (each one is a decay time)",
+    )
+    parser.add_argument(
+        "--reverb-decay",
+        type=float,
+        metavar="SECONDS",
+        help="seconds for the reverb tail to fall 60 dB (overrides --reverb-room)",
+    )
+    parser.add_argument(
+        "--reverb-predelay",
+        type=float,
+        metavar="MS",
+        help="silence before the tail starts; a longer gap reads as a bigger room",
     )
     parser.add_argument(
         "--reverb-mix",
@@ -356,6 +393,23 @@ def _add_fx_arguments(parser: argparse.ArgumentParser) -> None:
         help="damp the reverb above this frequency (default 7000, 0 disables)",
     )
     parser.add_argument("--ir-file", help="wav impulse response for convolution reverb")
+    parser.add_argument(
+        "--bass", type=float, metavar="DB", help="low shelf in dB (e.g. +6, -3)"
+    )
+    parser.add_argument(
+        "--treble", type=float, metavar="DB", help="high shelf in dB (e.g. -6)"
+    )
+    parser.add_argument(
+        "--stereo-width",
+        type=float,
+        metavar="N",
+        help="1.0 leaves the stereo image alone, 1.5 widens it, 0 collapses to mono",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="bring the loudness to about -14 LUFS",
+    )
     parser.add_argument("--format", help="output extension (e.g. mp3, wav, flac)")
     parser.add_argument("--bitrate", help="output bitrate (e.g. 192k)")
     parser.add_argument(

@@ -100,24 +100,40 @@ def test_resolve_resampler_choices():
 # --------------------------------------------------------------------------
 
 
-def test_echo_stages_split_four_taps_into_two_filters():
-    delays = (29.0, 41.0, 71.0, 113.0)
-    decays = (0.5, 0.42, 0.42, 0.32)
-    stages = fr._echo_stages(delays, decays)
-    assert len(stages) == 2
-    assert stages[0] == (delays[:2], decays[:2])
-    assert stages[1] == (delays[2:], decays[2:])
+def test_tap_gains_put_the_tail_on_an_exponential_slope():
+    """A tap `d` ms in must sit at 10**(-3*d/decay), so that chained stages -
+    where delays add and gains multiply - land every combination on the same
+    curve. That identity is what makes the decay time mean anything."""
+    decay = 1.5
+    for delays, gains in fr.reverb_taps(decay):
+        for delay, gain in zip(delays, gains):
+            assert gain == pytest.approx(10 ** (-3 * delay / (decay * 1000)), rel=1e-3)
 
 
-def test_echo_stages_keep_short_tap_lists_in_one_filter():
-    assert len(fr._echo_stages((60.0,), (0.4,))) == 1
+def test_the_tail_spans_exactly_one_decay_time():
+    for decay in (0.5, 1.2, 3.0):
+        spread = sum(max(delays) for delays, _ in fr.reverb_taps(decay))
+        assert spread == pytest.approx(decay * 1000, rel=0.01)
+
+
+def test_a_longer_decay_moves_every_tap_further_out():
+    short = fr.reverb_taps(0.5)
+    long = fr.reverb_taps(3.0)
+    for (short_delays, _), (long_delays, _) in zip(short, long):
+        assert max(long_delays) > max(short_delays)
+
+
+def test_every_room_has_its_own_decay():
+    decays = list(fr.REVERB_ROOMS.values())
+    assert decays == sorted(decays), "rooms should grow in order"
+    assert len(set(decays)) == len(decays), "two rooms sounding alike is the bug"
 
 
 def test_reverb_send_highpasses_before_the_tail():
     before, after = fr.build_reverb_send_filters(fr.ReverbSettings())
     assert after == []
     assert before[0] == "highpass=f=200:poles=2"
-    assert sum(1 for part in before if part.startswith("aecho=")) == 2
+    assert sum(1 for part in before if part.startswith("aecho=")) == fr.REVERB_STAGES
     assert before[-2] == "lowpass=f=7000"
     assert before[-1].startswith("volume=")
 
@@ -126,16 +142,36 @@ def test_wet_level_is_normalised_by_the_echo_gain():
     reverb = fr.ReverbSettings(mix=0.35)
     before, _ = fr.build_reverb_send_filters(reverb)
     level = float(before[-1].split("=")[1])
-    expected = 0.35 / fr.echo_power_gain(reverb.delays, reverb.decays)
+    expected = 0.35 / fr.echo_power_gain(reverb.stages)
     assert level == pytest.approx(expected, rel=1e-4)
     # more taps must not mean a louder reverb
     assert level < 0.35
 
 
-def test_echo_power_gain_grows_with_the_taps():
-    quiet = fr.echo_power_gain((50.0,), (0.2,))
-    loud = fr.echo_power_gain((29.0, 41.0, 71.0, 113.0), (0.5, 0.42, 0.42, 0.32))
-    assert 1.0 < quiet < loud
+def test_loudness_does_not_change_with_the_room():
+    """Picking a bigger room has to change the character, not the volume."""
+    gains = [fr.echo_power_gain(fr.reverb_taps(d)) for d in fr.REVERB_ROOMS.values()]
+    assert max(gains) - min(gains) < 0.01
+
+
+def test_the_send_drops_the_direct_signal():
+    """in_gain=0 on the first stage. With 1 the send would carry a copy of the
+    dry signal and `mix` would mostly just turn the track up."""
+    before, _ = fr.build_reverb_send_filters(fr.ReverbSettings())
+    echoes = [part for part in before if part.startswith("aecho=")]
+    assert echoes[0].startswith("aecho=0:1:")
+    for later in echoes[1:]:
+        assert later.startswith("aecho=1:1:")
+
+
+def test_predelay_comes_before_everything_else():
+    before, _ = fr.build_reverb_send_filters(fr.ReverbSettings(predelay=40))
+    assert before[0] == "adelay=40:all=1"
+
+
+def test_no_predelay_means_no_delay_filter():
+    before, _ = fr.build_reverb_send_filters(fr.ReverbSettings(predelay=0))
+    assert not any(part.startswith("adelay") for part in before)
 
 
 def test_ir_wet_level_is_not_rescaled(tmp_path: Path):
@@ -143,14 +179,6 @@ def test_ir_wet_level_is_not_rescaled(tmp_path: Path):
     ir.write_bytes(b"RIFF")
     _, after = fr.build_reverb_send_filters(fr.ReverbSettings(ir_file=ir, mix=0.4))
     assert after[-1] == "volume=0.4"
-
-
-def test_reverb_send_uses_unit_gains_in_the_echoes():
-    before, _ = fr.build_reverb_send_filters(fr.ReverbSettings())
-    for part in before:
-        if part.startswith("aecho="):
-            # the dry signal is mixed back separately, so in/out gain stay at 1
-            assert part.split(":")[0] == "aecho=1" and part.split(":")[1] == "1"
 
 
 def test_reverb_send_can_disable_the_filters():
@@ -196,7 +224,18 @@ def test_ir_graph_adds_the_second_input(tmp_path: Path):
     spec = fr.FxSpec(tempo=0.9, reverb=fr.ReverbSettings(ir_file=ir))
     plan = fr.plan_filters(spec, SR, "classic")
     assert plan.extra_inputs == [ir]
-    assert "[ir_in][1:a]afir=dry=0:wet=1[conv]" in plan.description
+    assert "[ir_in][1:a]afir=wet=1[conv]" in plan.description
+
+
+def test_afir_is_never_given_a_zero_input_gain():
+    """afir's `dry` scales its *input*, it is not a dry/wet balance. dry=0
+    feeds it silence and the whole reverb disappears - the bug that made the
+    concert hall setting produce nothing at all."""
+    ir = Path(__file__).parent.parent / "audiofx" / "assets" / "ir" / "hall_large.wav"
+    if not ir.is_file():  # pragma: no cover - assets always ship
+        pytest.skip("IR asset missing")
+    graph = fr.plan_filters(fr.FxSpec(reverb=fr.ReverbSettings(ir_file=ir)), SR).description
+    assert "dry=0" not in graph
 
 
 def test_plan_without_reverb_uses_a_simple_chain():
@@ -227,13 +266,69 @@ def test_plan_for_identity_spec_has_no_filter_argument():
         fr.FxSpec(reverb=fr.ReverbSettings(mix=3)),
         fr.FxSpec(reverb=fr.ReverbSettings(highpass=8000, lowpass=4000)),
         fr.FxSpec(reverb=fr.ReverbSettings(highpass=-1)),
-        fr.FxSpec(reverb=fr.ReverbSettings(decays=(2.0,), delays=(50.0,))),
-        fr.FxSpec(reverb=fr.ReverbSettings(delays=(10, 20), decays=(0.3,))),
+        fr.FxSpec(reverb=fr.ReverbSettings(decay=0)),
+        fr.FxSpec(reverb=fr.ReverbSettings(decay=100)),
+        fr.FxSpec(reverb=fr.ReverbSettings(predelay=-5)),
+        fr.FxSpec(reverb=fr.ReverbSettings(predelay=5000)),
+        fr.FxSpec(bass_gain=50),
+        fr.FxSpec(treble_gain=-50),
+        fr.FxSpec(stereo_width=-1),
+        fr.FxSpec(stereo_width=99),
     ],
 )
 def test_invalid_specs_are_rejected(spec):
     with pytest.raises(ValueError):
         spec.validate()
+
+
+# --------------------------------------------------------------------------
+# tone, width and loudness
+# --------------------------------------------------------------------------
+
+
+def test_tone_filters_are_shelves_around_the_defaults():
+    assert fr.build_tone_filters(fr.FxSpec()) == []
+    filters = fr.build_tone_filters(fr.FxSpec(bass_gain=6, treble_gain=-3))
+    assert filters == [f"bass=g=6:f={fr._fmt(fr.BASS_SHELF_HZ)}",
+                       f"treble=g=-3:f={fr._fmt(fr.TREBLE_SHELF_HZ)}"]
+
+
+def test_tone_runs_before_the_split_so_the_tail_hears_it():
+    spec = fr.FxSpec(bass_gain=6, reverb=fr.ReverbSettings())
+    graph = fr.plan_filters(spec, SR, "classic").description
+    assert graph.index("bass=g=6") < graph.index("asplit=2")
+
+
+def test_master_chain_is_empty_when_nothing_is_asked_for():
+    assert fr.build_master_filters(fr.FxSpec(), SR) == []
+
+
+def test_stereo_width_and_loudness_land_after_the_mix():
+    spec = fr.FxSpec(stereo_width=1.5, normalize=True, reverb=fr.ReverbSettings())
+    graph = fr.plan_filters(spec, SR, "classic").description
+    assert graph.index("amix=") < graph.index("extrastereo=")
+    assert graph.index("extrastereo=") < graph.index("loudnorm=")
+
+
+def test_loudnorm_is_followed_by_a_resample():
+    """loudnorm runs its internals at 192 kHz and hands that rate on; without
+    the resample the output file would silently change sample rate."""
+    filters = fr.build_master_filters(fr.FxSpec(normalize=True), SR)
+    assert filters[filters.index(f"loudnorm=I=-14:TP=-1.5:LRA=11") + 1] == f"aresample={SR}"
+
+
+def test_anything_that_can_add_level_gets_the_limiter():
+    for spec in (
+        fr.FxSpec(bass_gain=6),
+        fr.FxSpec(normalize=True),
+        fr.FxSpec(stereo_width=1.5),
+        fr.FxSpec(reverb=fr.ReverbSettings()),
+    ):
+        assert any(f.startswith("alimiter") for f in fr.build_master_filters(spec, SR))
+
+
+def test_a_plain_slowdown_needs_no_limiter():
+    assert fr.build_master_filters(fr.FxSpec(tempo=0.85), SR) == []
 
 
 def test_pitch_ratio_follows_tempo_by_default():
@@ -266,7 +361,7 @@ def test_build_command_ir_uses_two_inputs(tmp_path: Path):
     spec = fr.FxSpec(tempo=0.9, reverb=fr.ReverbSettings(ir_file=ir))
     cmd = fr.build_command(tmp_path / "in.wav", tmp_path / "out.wav", spec)
     assert cmd.count("-i") == 2
-    assert "afir=dry=0:wet=1" in cmd[cmd.index("-filter_complex") + 1]
+    assert "afir=wet=1" in cmd[cmd.index("-filter_complex") + 1]
     assert cmd[cmd.index("-map") + 1] == "[out]"
 
 
@@ -348,9 +443,10 @@ def test_probe_reads_sample(sample_wav: Path):
         (fr.FxSpec(tempo=0.5), 4.0),
         (fr.FxSpec(tempo=2.0), 1.0),
         (fr.FxSpec(tempo=0.4, preserve_pitch=True), 5.0),
-        # the reverb tail adds roughly the sum of the longest tap per stage
-        (fr.FxSpec(tempo=0.85, reverb=fr.ReverbSettings()), 2 / 0.85 + 0.154),
-        (fr.FxSpec(reverb=fr.ReverbSettings()), 2.154),
+        # the tail adds one decay time to the end of the file
+        (fr.FxSpec(tempo=0.85, reverb=fr.ReverbSettings()),
+         2 / 0.85 + fr.ReverbSettings().tail_ms / 1000),
+        (fr.FxSpec(reverb=fr.ReverbSettings()), 2 + fr.ReverbSettings().tail_ms / 1000),
     ],
 )
 def test_conversion_duration_matches_factor(sample_wav, tmp_path, spec, expected):
@@ -391,7 +487,8 @@ def test_conversion_to_mp3_produces_valid_file(sample_wav, tmp_path):
     assert result.filter_chain
     info = fr.probe(out)
     assert info.codec == "mp3"
-    assert info.duration == pytest.approx(2 / 0.85 + 0.154, rel=0.05)
+    expected = 2 / 0.85 + fr.ReverbSettings().tail_ms / 1000
+    assert info.duration == pytest.approx(expected, rel=0.05)
 
 
 @ffmpeg_required

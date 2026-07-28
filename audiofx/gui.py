@@ -13,6 +13,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,9 @@ from . import downloader, preview, theme
 from .ffmpeg_runner import (
     AUDIO_EXTENSIONS,
     LOSSY_EXTENSIONS,
-    REVERB_SIZES,
+    MAX_STEREO_WIDTH,
+    MAX_TONE_DB,
+    REVERB_ROOMS,
     AudioInfo,
     FFmpegError,
     FxSpec,
@@ -32,7 +35,15 @@ from .ffmpeg_runner import (
     probe,
 )
 from .metadata import copy_metadata
-from .presets import load_presets
+from .presets import (
+    Preset,
+    PresetError,
+    combined_presets,
+    delete_user_preset,
+    load_presets,
+    save_user_preset,
+    valid_preset_name,
+)
 
 SETTINGS_FILE = Path.home() / ".audiofx-gui.json"
 
@@ -51,15 +62,17 @@ QUALITY_CHOICES: dict[str, tuple[str | None, str | None]] = {
     "MP3 320 kbps": ("mp3", "320k"),
 }
 
-# label -> reverb size key; "hall" switches to IR convolution
+# label -> room key in REVERB_ROOMS; each one is really a decay time
 ROOM_CHOICES: dict[str, str] = {
     "Small room": "small",
     "Medium room": "medium",
     "Large room": "large",
-    "Concert hall (IR)": "hall",
+    "Concert hall": "hall",
+    "Cathedral": "cathedral",
 }
 
 CUSTOM_PRESET = "Custom"
+CUSTOM_ROOM = "Custom"
 
 # label -> preview length in seconds; None renders the whole track
 PREVIEW_LENGTHS: dict[str, float | None] = {
@@ -141,35 +154,57 @@ class JobOptions:
     factor: float
     preserve_pitch: bool
     pitch_shift: float
-    reverb_room: str
+    reverb_decay: float
     reverb_mix: float
     reverb_bass_cut: float
     quality: str
     preset_name: str | None
     copy_tags: bool
     output_dir: Path
+    reverb_predelay: float = 0.0
     reverb_damping: float = 7000.0
-    ir_file: Path | None = None
+    bass: float = 0.0
+    treble: float = 0.0
+    stereo_width: float = 1.0
+    normalize: bool = False
 
     def build_spec(self) -> FxSpec:
         reverb = None
         if self.mode in ("reverb", "slowed_reverb"):
-            common = dict(
+            reverb = ReverbSettings(
+                decay=self.reverb_decay,
+                predelay=self.reverb_predelay,
                 mix=self.reverb_mix,
                 highpass=self.reverb_bass_cut,
                 lowpass=self.reverb_damping,
             )
-            if self.reverb_room == "hall" and self.ir_file is not None:
-                reverb = ReverbSettings(ir_file=self.ir_file, **common)
-            else:
-                delays, decays = REVERB_SIZES.get(self.reverb_room, REVERB_SIZES["medium"])
-                reverb = ReverbSettings(delays=delays, decays=decays, **common)
         return FxSpec(
             tempo=1.0 if self.mode == "reverb" else self.factor,
             pitch_semitones=self.pitch_shift or None,
             preserve_pitch=self.preserve_pitch,
             reverb=reverb,
             engine="auto",
+            bass_gain=self.bass,
+            treble_gain=self.treble,
+            stereo_width=self.stereo_width,
+            normalize=self.normalize,
+        )
+
+    def to_preset(self, name: str, description: str = "") -> Preset:
+        """The same settings as a saveable preset."""
+        return Preset(
+            name=name,
+            description=description,
+            mode=self.mode,
+            factor=self.factor,
+            pitch_shift=self.pitch_shift or None,
+            preserve_pitch=self.preserve_pitch,
+            engine="auto",
+            bass=self.bass,
+            treble=self.treble,
+            stereo_width=self.stereo_width,
+            normalize=self.normalize,
+            reverb=self.build_spec().reverb,
         )
 
 
@@ -206,6 +241,12 @@ class AudioFxApp(ttk.Frame):
         self._preview_token = 0
         self._preview_playing = False
         self._preview_name = ""
+        self._seeking = False
+        self._playing_since: float | None = None
+        self._preview_pace = 1.0
+        self._preview_origin = 0.0
+        self._preview_span: float | None = None
+        self._builtin_names: set[str] = set()
         self.palette = theme.palette_for(theme.DEFAULT_THEME)
         self._prefs_window: tk.Toplevel | None = None
 
@@ -375,6 +416,7 @@ class AudioFxApp(ttk.Frame):
         self.tree.column("size", width=80, anchor="e", stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self._play_selected)
+        self.tree.bind("<<TreeviewSelect>>", self._update_preview_range)
 
         scroll = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -397,15 +439,33 @@ class AudioFxApp(ttk.Frame):
         preview_box.columnconfigure(6, weight=1)
 
         self.preview_button = ttk.Button(
-            preview_box, text="Play preview", command=self.preview_selected
+            preview_box, text="Play preview", command=self.preview_selected, width=13
         )
-        self.preview_button.grid(row=0, column=0, sticky="w")
+        self.preview_button.grid(row=0, column=0, rowspan=2, sticky="w")
         self.preview_stop_button = ttk.Button(
-            preview_box, text="Stop", command=self.stop_preview, state="disabled", width=8
+            preview_box, text="Stop", command=self.stop_preview, state="disabled", width=7
         )
-        self.preview_stop_button.grid(row=0, column=1, padx=(6, 12))
+        self.preview_stop_button.grid(row=0, column=1, rowspan=2, padx=(6, 10))
 
-        ttk.Label(preview_box, text="Length:").grid(row=0, column=2)
+        # the seek bar: drag it to choose where the excerpt starts, and watch it
+        # travel while the excerpt plays
+        self.preview_position_var = tk.DoubleVar(value=preview.DEFAULT_START)
+        self.preview_scale = ttk.Scale(
+            preview_box,
+            from_=0,
+            to=preview.DEFAULT_START * 2,
+            orient="horizontal",
+            variable=self.preview_position_var,
+            command=lambda _=None: self._update_preview_time(),
+        )
+        self.preview_scale.grid(row=0, column=2, columnspan=3, sticky="ew", padx=(0, 8))
+        self.preview_scale.bind("<ButtonPress-1>", self._seek_press)
+        self.preview_scale.bind("<ButtonRelease-1>", self._seek_release)
+
+        self.preview_time_label = ttk.Label(preview_box, text="0:00 / 0:00", width=13)
+        self.preview_time_label.grid(row=0, column=5, sticky="e")
+
+        ttk.Label(preview_box, text="Length:").grid(row=1, column=2, sticky="w")
         self.preview_length_var = tk.StringVar(value="20 seconds")
         ttk.Combobox(
             preview_box,
@@ -413,104 +473,100 @@ class AudioFxApp(ttk.Frame):
             state="readonly",
             values=list(PREVIEW_LENGTHS),
             width=12,
-        ).grid(row=0, column=3, padx=(6, 12))
-        ttk.Label(preview_box, text="Start at (s):").grid(row=0, column=4)
-        self.preview_start_var = tk.DoubleVar(value=preview.DEFAULT_START)
-        ttk.Spinbox(
-            preview_box,
-            from_=0,
-            to=3600,
-            increment=5,
-            width=6,
-            textvariable=self.preview_start_var,
-        ).grid(row=0, column=5, padx=(6, 0))
-
+        ).grid(row=1, column=3, sticky="w", padx=(6, 0))
         ttk.Label(
             preview_box,
-            text="Plays an excerpt of the selected song with the current settings; "
-            "nothing is written to the output folder.",
+            text="from wherever the bar sits",
             style="Hint.TLabel",
-            justify="left",
-        ).grid(row=1, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(8, 0))
 
-        # --- right: settings ---
+        # --- right: settings, on tabs so there is room to add controls ---
         right = ttk.Frame(self)
         right.grid(row=2, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(99, weight=1)
+        right.rowconfigure(1, weight=1)
 
         preset_box = ttk.LabelFrame(right, text="Preset", padding=6)
         preset_box.grid(row=0, column=0, sticky="ew")
         preset_box.columnconfigure(0, weight=1)
         self.preset_var = tk.StringVar(value=CUSTOM_PRESET)
         self.preset_combo = ttk.Combobox(
-            preset_box,
-            textvariable=self.preset_var,
-            state="readonly",
-            values=[CUSTOM_PRESET] + sorted(self.presets),
+            preset_box, textvariable=self.preset_var, state="readonly"
         )
-        self.preset_combo.grid(row=0, column=0, sticky="ew")
+        self.preset_combo.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.preset_combo.bind("<<ComboboxSelected>>", self._apply_preset)
+        self.preset_hint = ttk.Label(preset_box, text="", style="Hint.TLabel", wraplength=300)
+        self.preset_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 4))
+        ttk.Button(preset_box, text="Save as...", command=self.save_preset).grid(
+            row=2, column=0, sticky="w"
+        )
+        self.delete_preset_button = ttk.Button(
+            preset_box, text="Delete", command=self.delete_preset, state="disabled", width=9
+        )
+        self.delete_preset_button.grid(row=2, column=1, sticky="e")
+        self._refresh_preset_list()
 
-        effect_box = ttk.LabelFrame(right, text="Effect", padding=6)
-        effect_box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        effect_box.columnconfigure(0, weight=1)
+        notebook = ttk.Notebook(right)
+        notebook.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+
+        # --- Effect tab ---
+        effect = ttk.Frame(notebook, padding=8)
+        effect.columnconfigure(1, weight=1)
+        notebook.add(effect, text="Effect")
+
         self.mode_var = tk.StringVar(value="slowed_reverb")
         for index, (value, label) in enumerate(MODES):
             ttk.Radiobutton(
-                effect_box,
+                effect,
                 text=label,
                 value=value,
                 variable=self.mode_var,
                 command=self._on_mode_change,
-            ).grid(row=index, column=0, sticky="w")
+            ).grid(row=index, column=0, columnspan=3, sticky="w")
 
-        speed_box = ttk.LabelFrame(right, text="Speed", padding=6)
-        speed_box.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        speed_box.columnconfigure(0, weight=1)
+        speed_row = len(MODES)
+        ttk.Separator(effect, orient="horizontal").grid(
+            row=speed_row, column=0, columnspan=3, sticky="ew", pady=6
+        )
         self.factor_var = tk.DoubleVar(value=0.85)
-        self.speed_scale = ttk.Scale(
-            speed_box,
-            from_=0.40,
-            to=0.99,
-            orient="horizontal",
-            variable=self.factor_var,
-            command=lambda _=None: self._on_speed_change(),
+        self.speed_scale, self.speed_label = self._slider_row(
+            effect, speed_row + 1, "Speed:", self.factor_var, 0.40, 0.99,
+            self._on_speed_change,
         )
-        self.speed_scale.grid(row=0, column=0, columnspan=3, sticky="ew")
-        self.speed_label = ttk.Label(speed_box, text="")
-        self.speed_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Button(speed_box, text="-", width=3, command=lambda: self._nudge(-0.01)).grid(
-            row=1, column=1
+        nudge = ttk.Frame(effect)
+        nudge.grid(row=speed_row + 2, column=1, sticky="w", padx=(6, 0))
+        ttk.Button(nudge, text="-", width=3, command=lambda: self._nudge(-0.01)).pack(side="left")
+        ttk.Button(nudge, text="+", width=3, command=lambda: self._nudge(0.01)).pack(
+            side="left", padx=(4, 0)
         )
-        ttk.Button(speed_box, text="+", width=3, command=lambda: self._nudge(0.01)).grid(
-            row=1, column=2
-        )
+
         self.preserve_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            speed_box,
+            effect,
             text="Keep the original pitch",
             variable=self.preserve_var,
             command=self._mark_custom,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=speed_row + 3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        pitch_row = ttk.Frame(speed_box)
-        pitch_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        ttk.Label(pitch_row, text="Pitch shift (semitones):").pack(side="left")
+        ttk.Label(effect, text="Pitch shift:").grid(row=speed_row + 4, column=0, sticky="w")
         self.pitch_var = tk.DoubleVar(value=0.0)
         ttk.Spinbox(
-            pitch_row,
+            effect,
             from_=-12,
             to=12,
             increment=1,
-            width=5,
+            width=6,
             textvariable=self.pitch_var,
             command=self._mark_custom,
-        ).pack(side="left", padx=6)
+        ).grid(row=speed_row + 4, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(effect, text="semitones", style="Hint.TLabel").grid(
+            row=speed_row + 5, column=1, sticky="w", padx=(6, 0)
+        )
 
-        self.reverb_box = ttk.LabelFrame(right, text="Reverb", padding=6)
-        self.reverb_box.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        # --- Reverb tab ---
+        self.reverb_box = ttk.Frame(notebook, padding=8)
         self.reverb_box.columnconfigure(1, weight=1)
+        notebook.add(self.reverb_box, text="Reverb")
 
         ttk.Label(self.reverb_box, text="Room:").grid(row=0, column=0, sticky="w")
         self.room_var = tk.StringVar(value="Medium room")
@@ -518,27 +574,26 @@ class AudioFxApp(ttk.Frame):
             self.reverb_box,
             textvariable=self.room_var,
             state="readonly",
-            values=list(ROOM_CHOICES),
-            width=18,
+            values=[*ROOM_CHOICES, CUSTOM_ROOM],
+            width=16,
         )
-        self.room_combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        self.room_combo.bind("<<ComboboxSelected>>", lambda _event: self._mark_custom())
+        self.room_combo.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.room_combo.bind("<<ComboboxSelected>>", self._on_room_change)
 
-        ttk.Label(self.reverb_box, text="Amount:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.decay_var = tk.DoubleVar(value=REVERB_ROOMS["medium"])
+        self.decay_scale, self.decay_label = self._slider_row(
+            self.reverb_box, 1, "Decay:", self.decay_var, 0.2, 8.0, self._on_decay_change
+        )
         self.mix_var = tk.DoubleVar(value=0.35)
-        self.mix_scale = ttk.Scale(
-            self.reverb_box,
-            from_=0.05,
-            to=0.80,
-            orient="horizontal",
-            variable=self.mix_var,
-            command=lambda _=None: self._on_mix_change(),
+        self.mix_scale, self.mix_label = self._slider_row(
+            self.reverb_box, 2, "Amount:", self.mix_var, 0.05, 1.0, self._on_mix_change
         )
-        self.mix_scale.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
-        self.mix_label = ttk.Label(self.reverb_box, text="")
-        self.mix_label.grid(row=2, column=1, sticky="w", padx=(6, 0))
+        self.predelay_var = tk.DoubleVar(value=0.0)
+        self.predelay_scale, self.predelay_label = self._slider_row(
+            self.reverb_box, 3, "Pre-delay:", self.predelay_var, 0, 200, self._on_slider_change
+        )
 
-        ttk.Label(self.reverb_box, text="Bass cut (Hz):").grid(row=3, column=0, sticky="w")
+        ttk.Label(self.reverb_box, text="Bass cut:").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.bass_cut_var = tk.DoubleVar(value=200.0)
         self.bass_cut_spin = ttk.Spinbox(
             self.reverb_box,
@@ -549,17 +604,84 @@ class AudioFxApp(ttk.Frame):
             textvariable=self.bass_cut_var,
             command=self._mark_custom,
         )
-        self.bass_cut_spin.grid(row=3, column=1, sticky="w", padx=(6, 0))
+        self.bass_cut_spin.grid(row=4, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+
+        ttk.Label(self.reverb_box, text="Damping:").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self.damping_var = tk.DoubleVar(value=7000.0)
+        self.damping_spin = ttk.Spinbox(
+            self.reverb_box,
+            from_=1000,
+            to=16000,
+            increment=500,
+            width=7,
+            textvariable=self.damping_var,
+            command=self._mark_custom,
+        )
+        self.damping_spin.grid(row=5, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+
         ttk.Label(
             self.reverb_box,
-            text="Keeps the low end out of the tail; raise it if it sounds boomy.",
+            text="Decay is how long the tail takes to fade out - it is what makes a\n"
+            "small room and a cathedral sound different. Bass cut keeps the low\n"
+            "end out of the tail (raise it if it sounds boomy); damping rolls the\n"
+            "highs off, the way a real room absorbs them.",
             style="Hint.TLabel",
             justify="left",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        out_box = ttk.LabelFrame(right, text="Output", padding=6)
-        out_box.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        self._reverb_widgets = [
+            self.room_combo,
+            self.decay_scale,
+            self.mix_scale,
+            self.predelay_scale,
+            self.bass_cut_spin,
+            self.damping_spin,
+        ]
+
+        # --- Tone tab ---
+        tone = ttk.Frame(notebook, padding=8)
+        tone.columnconfigure(1, weight=1)
+        notebook.add(tone, text="Tone")
+
+        self.bass_var = tk.DoubleVar(value=0.0)
+        self.bass_scale, self.bass_label = self._slider_row(
+            tone, 0, "Bass:", self.bass_var, -MAX_TONE_DB, MAX_TONE_DB, self._on_slider_change
+        )
+        self.treble_var = tk.DoubleVar(value=0.0)
+        self.treble_scale, self.treble_label = self._slider_row(
+            tone, 1, "Treble:", self.treble_var, -MAX_TONE_DB, MAX_TONE_DB,
+            self._on_slider_change,
+        )
+        self.width_var = tk.DoubleVar(value=1.0)
+        self.width_scale, self.width_label = self._slider_row(
+            tone, 2, "Stereo width:", self.width_var, 0.0, MAX_STEREO_WIDTH,
+            self._on_slider_change,
+        )
+        self.normalize_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            tone,
+            text="Even out the loudness (about -14 LUFS)",
+            variable=self.normalize_var,
+            command=self._mark_custom,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        ttk.Button(tone, text="Reset tone", command=self.reset_tone).grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(
+            tone,
+            text="Bass and treble are shelves applied before the reverb, so the tail\n"
+            "reacts to them. Stereo width of 1.0 leaves the image alone, 0 folds it\n"
+            "down to mono, and anything above 1 pushes the sides out.",
+            style="Hint.TLabel",
+            justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        # --- Output tab ---
+        out_box = ttk.Frame(notebook, padding=8)
         out_box.columnconfigure(0, weight=1)
+        notebook.add(out_box, text="Output")
+
         self.quality_var = tk.StringVar(value=next(iter(QUALITY_CHOICES)))
         ttk.Combobox(
             out_box,
@@ -580,7 +702,7 @@ class AudioFxApp(ttk.Frame):
 
         self.output_var = tk.StringVar(value=str(self.output_dir))
         ttk.Entry(out_box, textvariable=self.output_var, state="readonly").grid(
-            row=3, column=0, sticky="ew", pady=(6, 0)
+            row=3, column=0, sticky="ew", pady=(8, 0)
         )
         out_buttons = ttk.Frame(out_box)
         out_buttons.grid(row=4, column=0, sticky="ew", pady=(4, 0))
@@ -590,7 +712,7 @@ class AudioFxApp(ttk.Frame):
         ).pack(side="left", padx=6)
 
         action = ttk.Frame(right)
-        action.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        action.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         action.columnconfigure(0, weight=1)
         self.convert_button = ttk.Button(
             action, text="Convert selected", command=self.convert_selected
@@ -626,7 +748,8 @@ class AudioFxApp(ttk.Frame):
         self.log.configure(yscrollcommand=log_scroll.set)
 
         self._on_mode_change()
-        self._update_mix_label()
+        self._update_labels()
+        self._update_preview_time()
 
     # ------------------------------------------------------------------
     # settings
@@ -653,22 +776,31 @@ class AudioFxApp(ttk.Frame):
             self.mode_var.set(data["mode"])
         if isinstance(data.get("factor"), (int, float)):
             self.factor_var.set(float(data["factor"]))
-        if data.get("room") in ROOM_CHOICES:
-            self.room_var.set(data["room"])
+        # the room name is derived from the decay time, not stored
         if isinstance(data.get("reverb_mix"), (int, float)):
             self.mix_var.set(float(data["reverb_mix"]))
-        if isinstance(data.get("reverb_bass_cut"), (int, float)):
-            self.bass_cut_var.set(float(data["reverb_bass_cut"]))
+        for key, variable in (
+            ("reverb_bass_cut", self.bass_cut_var),
+            ("reverb_damping", self.damping_var),
+            ("reverb_decay", self.decay_var),
+            ("reverb_predelay", self.predelay_var),
+            ("bass", self.bass_var),
+            ("treble", self.treble_var),
+            ("stereo_width", self.width_var),
+            ("preview_start", self.preview_position_var),
+        ):
+            if isinstance(data.get(key), (int, float)):
+                variable.set(float(data[key]))
         if data.get("theme") in theme.THEME_CHOICES:
             self.theme_var.set(data["theme"])
         if data.get("preview_length") in PREVIEW_LENGTHS:
             self.preview_length_var.set(data["preview_length"])
-        if isinstance(data.get("preview_start"), (int, float)):
-            self.preview_start_var.set(float(data["preview_start"]))
+        self.normalize_var.set(bool(data.get("normalize", False)))
         self.preserve_var.set(bool(data.get("preserve_pitch", False)))
         self.recursive_var.set(bool(data.get("recursive", False)))
+        self.room_var.set(self._room_label_for_decay(self.decay_var.get()))
         self._on_mode_change()
-        self._update_mix_label()
+        self._update_labels()
 
     def save_settings(self) -> None:
         payload = {
@@ -677,14 +809,20 @@ class AudioFxApp(ttk.Frame):
             "quality": self.quality_var.get(),
             "mode": self.mode_var.get(),
             "factor": round(float(self.factor_var.get()), 3),
-            "room": self.room_var.get(),
             "reverb_mix": round(float(self.mix_var.get()), 3),
+            "reverb_decay": round(float(self.decay_var.get()), 2),
+            "reverb_predelay": round(float(self.predelay_var.get()), 1),
             "reverb_bass_cut": round(float(self.bass_cut_var.get()), 1),
+            "reverb_damping": round(float(self.damping_var.get()), 1),
+            "bass": round(float(self.bass_var.get()), 2),
+            "treble": round(float(self.treble_var.get()), 2),
+            "stereo_width": round(float(self.width_var.get()), 3),
+            "normalize": bool(self.normalize_var.get()),
             "preserve_pitch": bool(self.preserve_var.get()),
             "recursive": bool(self.recursive_var.get()),
             "theme": theme.normalize(self.theme_var.get()),
             "preview_length": self.preview_length_var.get(),
-            "preview_start": round(float(self.preview_start_var.get()), 1),
+            "preview_start": round(float(self.preview_position_var.get()), 1),
         }
         try:
             self.settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -757,17 +895,75 @@ class AudioFxApp(ttk.Frame):
     # control callbacks
     # ------------------------------------------------------------------
 
+    def _slider_row(
+        self,
+        parent: tk.Misc,
+        row: int,
+        label: str,
+        variable: tk.DoubleVar,
+        low: float,
+        high: float,
+        command,
+    ) -> tuple[ttk.Scale, ttk.Label]:
+        """One "label / slider / value" line, the shape every setting uses."""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
+        scale = ttk.Scale(
+            parent,
+            from_=low,
+            to=high,
+            orient="horizontal",
+            variable=variable,
+            command=lambda _=None: command(),
+        )
+        scale.grid(row=row, column=1, sticky="ew", padx=(6, 6), pady=(4, 0))
+        value = ttk.Label(parent, text="", width=11, anchor="e")
+        value.grid(row=row, column=2, sticky="e", pady=(4, 0))
+        return scale, value
+
     def _mark_custom(self) -> None:
         if not self._loading_preset:
             self.preset_var.set(CUSTOM_PRESET)
+            self._update_preset_hint()
+
+    def _on_slider_change(self) -> None:
+        self._update_labels()
+        self._mark_custom()
 
     def _on_speed_change(self) -> None:
-        self._update_speed_label()
+        self._update_labels()
         self._mark_custom()
 
     def _on_mix_change(self) -> None:
-        self._update_mix_label()
+        self._update_labels()
         self._mark_custom()
+
+    def _on_decay_change(self) -> None:
+        """Moving the decay slider by hand means the room is no longer a preset."""
+        if not self._loading_preset:
+            self.room_var.set(self._room_label_for_decay(self.decay_var.get()))
+        self._update_labels()
+        self._mark_custom()
+
+    def _on_room_change(self, _event=None) -> None:
+        key = ROOM_CHOICES.get(self.room_var.get())
+        if key is not None:
+            self.decay_var.set(REVERB_ROOMS[key])
+        self._update_labels()
+        self._mark_custom()
+
+    @staticmethod
+    def _room_label_for_decay(decay: float) -> str:
+        for label, key in ROOM_CHOICES.items():
+            if abs(REVERB_ROOMS[key] - decay) < 0.05:
+                return label
+        return CUSTOM_ROOM
+
+    def reset_tone(self) -> None:
+        self.bass_var.set(0.0)
+        self.treble_var.set(0.0)
+        self.width_var.set(1.0)
+        self.normalize_var.set(False)
+        self._on_slider_change()
 
     def _nudge(self, delta: float) -> None:
         low, high = SPEED_RANGE[self.mode_var.get()]
@@ -775,17 +971,25 @@ class AudioFxApp(ttk.Frame):
         self.factor_var.set(value)
         self._on_speed_change()
 
-    def _update_speed_label(self) -> None:
+    def _update_labels(self) -> None:
+        """Refresh every read-out next to a slider."""
         factor = float(self.factor_var.get())
         if self.mode_var.get() == "reverb":
-            self.speed_label.configure(text="Speed unchanged (1.00x)")
-            return
-        percent = abs(1 - factor) * 100
-        direction = "slower" if factor < 1 else "faster"
-        self.speed_label.configure(text=f"{factor:.2f}x  ({percent:.0f}% {direction})")
+            self.speed_label.configure(text="1.00x")
+        else:
+            percent = abs(1 - factor) * 100
+            direction = "slower" if factor < 1 else "faster"
+            self.speed_label.configure(text=f"{factor:.2f}x {percent:.0f}% {direction}")
 
-    def _update_mix_label(self) -> None:
+        self.decay_label.configure(text=f"{float(self.decay_var.get()):.1f} s")
         self.mix_label.configure(text=f"{float(self.mix_var.get()) * 100:.0f}% wet")
+        self.predelay_label.configure(text=f"{float(self.predelay_var.get()):.0f} ms")
+        self.bass_label.configure(text=f"{float(self.bass_var.get()):+.1f} dB")
+        self.treble_label.configure(text=f"{float(self.treble_var.get()):+.1f} dB")
+        width = float(self.width_var.get())
+        self.width_label.configure(
+            text="mono" if width < 0.05 else f"{width:.2f}x"
+        )
 
     def _on_mode_change(self) -> None:
         mode = self.mode_var.get()
@@ -801,22 +1005,20 @@ class AudioFxApp(ttk.Frame):
         else:
             self.factor_var.set(1.0)
 
-        for child in self.reverb_box.winfo_children():
-            try:
-                child.configure(state="normal" if reverb_on else "disabled")
-            except tk.TclError:  # pragma: no cover - widget without a state
-                pass
+        for widget in self._reverb_widgets:
+            widget.configure(state="normal" if reverb_on else "disabled")
         if reverb_on:
             # comboboxes must stay read-only, never fully editable
             self.room_combo.configure(state="readonly")
 
-        self._update_speed_label()
+        self._update_labels()
         self._mark_custom()
 
     def _apply_preset(self, _event=None) -> None:
         name = self.preset_var.get()
         preset = self.presets.get(name)
         if preset is None:
+            self._update_preset_hint()
             return
         self._loading_preset = True
         try:
@@ -825,29 +1027,124 @@ class AudioFxApp(ttk.Frame):
             self.factor_var.set(preset.factor if preset.mode != "reverb" else 1.0)
             self.preserve_var.set(preset.preserve_pitch)
             self.pitch_var.set(preset.pitch_shift or 0.0)
+            self.bass_var.set(preset.bass)
+            self.treble_var.set(preset.treble)
+            self.width_var.set(preset.stereo_width)
+            self.normalize_var.set(preset.normalize)
             if preset.reverb is not None:
                 self.mix_var.set(preset.reverb.mix)
                 self.bass_cut_var.set(preset.reverb.highpass)
-                self.room_var.set(self._room_label_for(preset.reverb))
-                if preset.reverb.ir_file is not None:
-                    self.ir_file = Path(preset.reverb.ir_file)
-            self._update_speed_label()
-            self._update_mix_label()
+                self.damping_var.set(preset.reverb.lowpass)
+                self.predelay_var.set(preset.reverb.predelay)
+                self.decay_var.set(preset.reverb.decay)
+                self.room_var.set(self._room_label_for_decay(preset.reverb.decay))
+            self._update_labels()
         finally:
             self._loading_preset = False
         self.preset_var.set(name)
+        self._update_preset_hint()
 
-    @staticmethod
-    def _room_label_for(reverb: ReverbSettings) -> str:
-        """Map a preset's reverb back onto one of the room choices."""
-        if reverb.ir_file is not None:
-            return "Concert hall (IR)"
-        taps = tuple(float(d) for d in reverb.delays)
-        for label, key in ROOM_CHOICES.items():
-            known = REVERB_SIZES.get(key)
-            if known and tuple(known[0]) == taps:
-                return label
-        return "Medium room"
+    # ------------------------------------------------------------------
+    # saving presets
+    # ------------------------------------------------------------------
+
+    def _refresh_preset_list(self) -> None:
+        """Reload the built-in and user presets into the combobox."""
+        try:
+            self.presets = combined_presets()
+        except PresetError as exc:  # pragma: no cover - broken yaml
+            messagebox.showwarning("Presets", str(exc))
+            return
+        try:
+            self._builtin_names = set(load_presets())
+        except PresetError:  # pragma: no cover - broken package file
+            self._builtin_names = set()
+        self.preset_combo.configure(values=[CUSTOM_PRESET] + sorted(self.presets))
+        self._update_preset_hint()
+
+    def _update_preset_hint(self) -> None:
+        name = self.preset_var.get()
+        preset = self.presets.get(name)
+        own = preset is not None and name not in self._builtin_names
+        self.delete_preset_button.configure(state="normal" if own else "disabled")
+        if preset is None:
+            self.preset_hint.configure(text="Your own settings. Save them to reuse later.")
+        else:
+            suffix = "  (yours)" if own else ""
+            self.preset_hint.configure(text=f"{preset.description}{suffix}")
+
+    def save_preset(self) -> None:
+        name = self._ask_text("Save preset", "Name for these settings:")
+        if name is None:
+            return
+        try:
+            name = valid_preset_name(name)
+        except PresetError as exc:
+            messagebox.showwarning("Preset name", str(exc))
+            return
+        if name in self.presets and not messagebox.askyesno(
+            "Replace preset", f"'{name}' already exists. Replace it?"
+        ):
+            return
+        try:
+            save_user_preset(self._current_options().to_preset(name, "saved from the interface"))
+        except (PresetError, OSError) as exc:
+            messagebox.showerror("Could not save", str(exc))
+            return
+        self._refresh_preset_list()
+        self._loading_preset = True
+        try:
+            self.preset_var.set(name)
+        finally:
+            self._loading_preset = False
+        self._update_preset_hint()
+        self._log(f"Saved preset '{name}'.")
+
+    def delete_preset(self) -> None:
+        name = self.preset_var.get()
+        if name in self._builtin_names or name not in self.presets:
+            return
+        if not messagebox.askyesno("Delete preset", f"Delete the preset '{name}'?"):
+            return
+        try:
+            delete_user_preset(name)
+        except (PresetError, OSError) as exc:  # pragma: no cover - disk error
+            messagebox.showerror("Could not delete", str(exc))
+            return
+        self._refresh_preset_list()
+        self.preset_var.set(CUSTOM_PRESET)
+        self._update_preset_hint()
+        self._log(f"Deleted preset '{name}'.")
+
+    def _ask_text(self, title: str, prompt: str) -> str | None:
+        """A themed stand-in for simpledialog, which is plain tk and stays light."""
+        window = tk.Toplevel(self.master)
+        window.title(title)
+        window.transient(self.master)
+        window.resizable(False, False)
+        window.configure(background=self.palette.window)
+
+        answer: dict[str, str | None] = {"value": None}
+        box = ttk.Frame(window, padding=12)
+        box.grid(sticky="nsew")
+        ttk.Label(box, text=prompt).grid(row=0, column=0, columnspan=2, sticky="w")
+        entry = ttk.Entry(box, width=32)
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        entry.focus_set()
+
+        def accept(_event=None) -> None:
+            answer["value"] = entry.get()
+            window.destroy()
+
+        entry.bind("<Return>", accept)
+        entry.bind("<Escape>", lambda _event: window.destroy())
+        ttk.Button(box, text="Save", command=accept).grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(box, text="Cancel", command=window.destroy).grid(
+            row=2, column=1, sticky="e", pady=(12, 0)
+        )
+        window.grab_set()
+        self.master.wait_window(window)
+        return answer["value"]
 
     def choose_songs_dir(self) -> None:
         chosen = filedialog.askdirectory(initialdir=str(self.songs_dir), title="Songs folder")
@@ -934,9 +1231,46 @@ class AudioFxApp(ttk.Frame):
 
     def _preview_start(self) -> float:
         try:
-            return float(self.preview_start_var.get())
+            return float(self.preview_position_var.get())
         except (tk.TclError, ValueError):
             return preview.DEFAULT_START
+
+    def _preview_duration(self) -> float:
+        song = self._preview_song()
+        if song is not None and song.info and song.info.duration:
+            return float(song.info.duration)
+        return 0.0
+
+    def _update_preview_range(self, _event=None) -> None:
+        """Fit the seek bar to whichever song is selected."""
+        duration = self._preview_duration()
+        self.preview_scale.configure(to=max(duration, 1.0))
+        if duration and self._preview_start() > duration:
+            self.preview_position_var.set(0.0)
+        self._update_preview_time()
+
+    def _update_preview_time(self) -> None:
+        position = self._preview_start()
+        duration = self._preview_duration()
+        self.preview_time_label.configure(
+            text=f"{human_duration(position) if position else '0:00'}"
+            f" / {human_duration(duration)}"
+        )
+
+    def _seek_press(self, _event=None) -> None:
+        self._seeking = True
+
+    def _seek_release(self, _event=None) -> None:
+        self._seeking = False
+        self._update_preview_time()
+        self._mark_custom_position()
+
+    def _mark_custom_position(self) -> None:
+        """Dragging the bar while a preview plays restarts it from there."""
+        if self.player.is_playing() or (
+            self.preview_worker and self.preview_worker.is_alive()
+        ):
+            self.preview_selected()
 
     def preview_selected(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -954,8 +1288,6 @@ class AudioFxApp(ttk.Frame):
             return
 
         options = self._current_options()
-        if options.reverb_room == "hall" and options.ir_file is None:
-            options.reverb_room = "large"
         length = PREVIEW_LENGTHS.get(self.preview_length_var.get(), preview.DEFAULT_LENGTH)
         total = song.info.duration if song.info else None
         start = preview.clamp_start(self._preview_start(), total, length)
@@ -963,6 +1295,12 @@ class AudioFxApp(ttk.Frame):
         self.player.stop()
         self._preview_token += 1
         self._preview_name = song.path.name
+        # the bar walks the source timeline, so it advances at the playback
+        # speed the effect produces, not at wall-clock speed
+        self._preview_pace = options.build_spec().tempo
+        self._preview_origin = start
+        self._preview_span = length
+        self.preview_position_var.set(start)
         self.preview_button.configure(state="disabled")
         self.preview_stop_button.configure(state="normal")
         self.status_var.set(f"Rendering preview: {song.path.name}")
@@ -1030,18 +1368,30 @@ class AudioFxApp(ttk.Frame):
             return
 
         self._preview_playing = True
+        self._playing_since = time.monotonic()
         self.preview_stop_button.configure(state="normal")
         self.status_var.set(f"Playing preview: {self._preview_name}")
 
     def _poll_player(self) -> None:
-        """Notice when ffplay reached the end of the excerpt on its own."""
+        """Advance the seek bar, and notice when playback ended on its own."""
         playing = self.player.is_playing()
+        if playing and not self._seeking and self._playing_since is not None:
+            elapsed = time.monotonic() - self._playing_since
+            position = self._preview_origin + elapsed * self._preview_pace
+            if self._preview_span:
+                position = min(position, self._preview_origin + self._preview_span)
+            duration = self._preview_duration()
+            self.preview_position_var.set(min(position, duration) if duration else position)
+            self._update_preview_time()
+
         if playing == self._preview_playing:
             return
         self._preview_playing = playing
         self.preview_stop_button.configure(state="normal" if playing else "disabled")
-        if not playing and self.status_var.get().startswith("Playing preview"):
-            self.status_var.set("Preview finished.")
+        if not playing:
+            self._playing_since = None
+            if self.status_var.get().startswith("Playing preview"):
+                self.status_var.set("Preview finished.")
 
     # ------------------------------------------------------------------
     # conversion
@@ -1054,14 +1404,19 @@ class AudioFxApp(ttk.Frame):
             factor=round(float(self.factor_var.get()), 3),
             preserve_pitch=bool(self.preserve_var.get()),
             pitch_shift=float(self.pitch_var.get() or 0),
-            reverb_room=ROOM_CHOICES.get(self.room_var.get(), "medium"),
+            reverb_decay=round(float(self.decay_var.get()), 2),
+            reverb_predelay=round(float(self.predelay_var.get()), 1),
             reverb_mix=round(float(self.mix_var.get()), 3),
             reverb_bass_cut=float(self.bass_cut_var.get()),
+            reverb_damping=float(self.damping_var.get()),
+            bass=round(float(self.bass_var.get()), 2),
+            treble=round(float(self.treble_var.get()), 2),
+            stereo_width=round(float(self.width_var.get()), 3),
+            normalize=bool(self.normalize_var.get()),
             quality=self.quality_var.get(),
             preset_name=None if preset == CUSTOM_PRESET else preset,
             copy_tags=bool(self.tags_var.get()),
             output_dir=self.output_dir,
-            ir_file=self.ir_file if self.ir_file.is_file() else None,
         )
 
     def convert_selected(self) -> None:
@@ -1086,11 +1441,6 @@ class AudioFxApp(ttk.Frame):
         # a preview playing over the conversion only confuses the status line
         self.stop_preview()
         options = self._current_options()
-        if options.reverb_room == "hall" and options.ir_file is None:
-            messagebox.showwarning(
-                "IR missing", "The impulse response file is missing; using the tap reverb instead."
-            )
-            options.reverb_room = "large"
 
         self.cancel_event.clear()
         self.convert_button.configure(state="disabled")

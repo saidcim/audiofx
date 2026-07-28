@@ -49,14 +49,40 @@ SOXR_PRECISION = 28
 # pathological input (a sustained full-scale tone lines every echo tap up).
 SAFETY_LIMIT = 0.98
 
-# Tap layouts for the reverb tail, shared by the CLI and the GUI. Delays are in
-# milliseconds; the values are mutually prime-ish so the taps never line up and
-# smear into a single flutter echo.
-REVERB_SIZES: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
-    "small": ((17.0, 29.0, 43.0, 61.0), (0.45, 0.36, 0.3, 0.22)),
-    "medium": ((29.0, 41.0, 71.0, 113.0), (0.5, 0.42, 0.42, 0.32)),
-    "large": ((53.0, 79.0, 131.0, 191.0), (0.55, 0.45, 0.4, 0.3)),
+# Room presets, shared by the CLI and the GUI: name -> decay time in seconds.
+# Decay is the only thing that separates a small room from a cathedral, so it
+# is the number the interface exposes.
+REVERB_ROOMS: dict[str, float] = {
+    "small": 0.5,
+    "medium": 1.2,
+    "large": 2.0,
+    "hall": 3.0,
+    "cathedral": 4.5,
 }
+
+# The tail is built by chaining aecho stages. Each stage convolves with the
+# previous one, so N stages of T taps produce T*(T+1)**(N-1) echoes - 768 of
+# them at the values below, which is dense enough to sound like a room instead
+# of a handful of distinct repeats.
+REVERB_STAGES = 5
+# Where each stage puts its taps inside its time budget. Prime-ish fractions,
+# so combinations from different stages never land on the same instant.
+TAP_FRACTIONS = (0.37, 0.61, 1.0)
+# Budget split between the stages: early stages fill the first milliseconds
+# densely, later ones stretch the tail out.
+STAGE_WEIGHTS = (1, 2, 4, 8, 16)
+# How far the tail falls over one decay time. 60 dB is the usual definition.
+DECAY_RANGE_DB = 60.0
+
+# Tone shelves and stereo width, both clamped to something musically sane.
+MAX_TONE_DB = 24.0
+BASS_SHELF_HZ = 110.0
+TREBLE_SHELF_HZ = 6000.0
+MAX_STEREO_WIDTH = 5.0
+
+# Integrated loudness target for the optional normalisation, in LUFS. -14 is
+# what most streaming services aim for.
+LOUDNESS_TARGET = -14.0
 
 
 class FFmpegError(RuntimeError):
@@ -227,10 +253,13 @@ class ReverbSettings:
     and clipped ("bass boosted"). Instead the signal is split, the send is
     high-passed so low frequencies never enter the tail, the tail is built
     there, and only `mix` of it is added back to the untouched dry signal.
+
+    `decay` is how long the tail takes to fall 60 dB. It is the control that
+    makes a small room sound different from a cathedral.
     """
 
-    delays: Sequence[float] = REVERB_SIZES["medium"][0]
-    decays: Sequence[float] = REVERB_SIZES["medium"][1]
+    decay: float = REVERB_ROOMS["medium"]  # seconds
+    predelay: float = 0.0  # ms of silence before the tail starts
     mix: float = 0.35
     highpass: float = 200.0  # Hz; 0 disables. Keeps bass out of the tail.
     lowpass: float = 7000.0  # Hz; 0 disables. Damps the tail like a real room.
@@ -243,37 +272,41 @@ class ReverbSettings:
             raise ValueError("reverb highpass/lowpass must not be negative")
         if self.highpass and self.lowpass and self.highpass >= self.lowpass:
             raise ValueError("reverb highpass must be below lowpass")
+        if self.predelay < 0 or self.predelay > 500:
+            raise ValueError("reverb pre-delay must be between 0 and 500 ms")
         if self.ir_file is not None:
             if not Path(self.ir_file).is_file():
                 raise ValueError(f"IR file not found: {self.ir_file}")
             return
-        if not self.delays or not self.decays:
-            raise ValueError("reverb delays/decays must not be empty")
-        if len(self.delays) != len(self.decays):
-            raise ValueError("reverb delays and decays must have the same length")
-        if any(d <= 0 for d in self.delays):
-            raise ValueError("reverb delay values must be positive")
-        if any(not 0 < d <= 1 for d in self.decays):
-            raise ValueError("reverb decay values must be between 0 and 1")
+        if not 0.05 <= self.decay <= 20:
+            raise ValueError("reverb decay must be between 0.05 and 20 seconds")
+
+    @property
+    def stages(self) -> list[tuple[tuple[float, ...], tuple[float, ...]]]:
+        return reverb_taps(self.decay)
 
     @property
     def tail_ms(self) -> float:
         """Roughly how much longer the output gets."""
         if self.ir_file is not None:
-            return 0.0
-        stages = _echo_stages(self.delays, self.decays)
-        return sum(max(delays) for delays, _ in stages)
+            return self.predelay
+        # the stage budgets add up to exactly one decay time
+        return self.predelay + self.decay * 1000
 
 
 @dataclass(frozen=True)
 class FxSpec:
-    """What to do to the audio: tempo, pitch and reverb."""
+    """What to do to the audio: tempo, pitch, tone, width and reverb."""
 
     tempo: float = 1.0
     pitch_semitones: float | None = None
     preserve_pitch: bool = False
     reverb: ReverbSettings | None = None
     engine: str = "auto"
+    bass_gain: float = 0.0  # dB at the low shelf
+    treble_gain: float = 0.0  # dB at the high shelf
+    stereo_width: float = 1.0  # 1.0 leaves the stereo image alone
+    normalize: bool = False  # bring the loudness to a streaming-ish target
 
     def validate(self) -> None:
         if not 0 < self.tempo <= 100:
@@ -282,8 +315,21 @@ class FxSpec:
             raise ValueError("pitch-shift must be between -48 and +48 semitones")
         if self.engine not in ENGINES:
             raise ValueError(f"engine must be one of {ENGINES}")
+        if abs(self.bass_gain) > MAX_TONE_DB or abs(self.treble_gain) > MAX_TONE_DB:
+            raise ValueError(f"bass/treble must be between -{MAX_TONE_DB} and +{MAX_TONE_DB} dB")
+        if not 0 <= self.stereo_width <= MAX_STEREO_WIDTH:
+            raise ValueError(f"stereo width must be between 0 and {MAX_STEREO_WIDTH}")
         if self.reverb is not None:
             self.reverb.validate()
+
+    @property
+    def has_tone(self) -> bool:
+        return not (_close(self.bass_gain, 0.0) and _close(self.treble_gain, 0.0))
+
+    @property
+    def has_master(self) -> bool:
+        """True when something runs after the wet/dry mix."""
+        return not _close(self.stereo_width, 1.0) or self.normalize
 
     @property
     def pitch_ratio(self) -> float:
@@ -397,35 +443,45 @@ def build_time_pitch_filters(
     return filters
 
 
-def _echo_stages(
-    delays: Sequence[float], decays: Sequence[float]
-) -> list[tuple[Sequence[float], Sequence[float]]]:
-    """Split the taps into chained aecho stages.
+Stage = tuple[tuple[float, ...], tuple[float, ...]]
 
-    Two chained `aecho` filters convolve with each other, so N+M taps become
-    N*M echoes. That density is what makes the tail sound like a room instead
-    of a slap-back echo, and it costs nothing extra.
+
+def reverb_taps(decay: float, stages: int = REVERB_STAGES) -> list[Stage]:
+    """Tap layout for a tail that falls 60 dB over `decay` seconds.
+
+    Chained `aecho` filters convolve, so delays add up while gains multiply. If
+    every tap's gain is set to 10**(-60/20 * delay / decay), then a combination
+    landing at total delay t automatically comes out at 10**(-3*t/decay) - an
+    exact exponential envelope, whatever the stage layout happens to be. That
+    identity is what makes the decay time mean something.
     """
-    if len(delays) >= 4:
-        middle = len(delays) // 2
-        return [
-            (delays[:middle], decays[:middle]),
-            (delays[middle:], decays[middle:]),
-        ]
-    return [(delays, decays)]
+    decay_ms = decay * 1000
+    weights = STAGE_WEIGHTS[:stages]
+    total = sum(weights)
+    layout: list[Stage] = []
+    for weight in weights:
+        budget = decay_ms * weight / total
+        delays = tuple(max(0.1, round(budget * f, 1)) for f in TAP_FRACTIONS)
+        gains = tuple(
+            round(10 ** (-DECAY_RANGE_DB / 20 * d / decay_ms), 6) for d in delays
+        )
+        layout.append((delays, gains))
+    return layout
 
 
-def echo_power_gain(delays: Sequence[float], decays: Sequence[float]) -> float:
+def echo_power_gain(stages: Sequence[Stage]) -> float:
     """How much louder the echo network makes the signal, in RMS terms.
 
-    Each `aecho` passes the input through plus one delayed copy per tap, so its
-    output power is 1 + sum(decay^2) and chained stages multiply. Dividing the
-    wet path by this keeps "mix" meaning the same amount of reverb no matter
-    how many taps the room uses.
+    An `aecho` outputs its input times in_gain plus one delayed copy per tap,
+    so its output power is in_gain^2 + sum(gain^2) and chained stages multiply.
+    The first stage runs at in_gain=0 - the send must carry tail only - so it
+    contributes no direct term. Dividing the wet path by this is what keeps
+    "mix" meaning the same amount of reverb at every decay time.
     """
     gain = 1.0
-    for _stage_delays, stage_decays in _echo_stages(delays, decays):
-        gain *= math.sqrt(1 + sum(d * d for d in stage_decays))
+    for index, (_delays, gains) in enumerate(stages):
+        direct = 0.0 if index == 0 else 1.0
+        gain *= math.sqrt(direct + sum(g * g for g in gains))
     return gain
 
 
@@ -438,6 +494,9 @@ def build_reverb_send_filters(reverb: ReverbSettings) -> tuple[list[str], list[s
     before: list[str] = []
     after: list[str] = []
 
+    if reverb.predelay:
+        # a gap before the tail is what tells the ear how big the room is
+        before.append(f"adelay={_fmt(reverb.predelay)}:all=1")
     if reverb.highpass:
         # Two poles: gentle enough to stay natural, steep enough to stop the
         # low end from piling up in the tail.
@@ -446,13 +505,17 @@ def build_reverb_send_filters(reverb: ReverbSettings) -> tuple[list[str], list[s
     target = before if reverb.ir_file is None else after
     level = reverb.mix
     if reverb.ir_file is None:
-        for delays, decays in _echo_stages(reverb.delays, reverb.decays):
+        stages = reverb.stages
+        for index, (delays, gains) in enumerate(stages):
             taps = "|".join(_fmt(d) for d in delays)
-            gains = "|".join(_fmt(d) for d in decays)
-            # in_gain/out_gain are 1 here: this path carries only the wet
-            # signal, the dry one is mixed back in separately.
-            target.append(f"aecho=1:1:{taps}:{gains}")
-        level /= echo_power_gain(reverb.delays, reverb.decays)
+            decays = "|".join(_fmt(g) for g in gains)
+            # in_gain is 0 on the first stage so the direct sound never enters
+            # the send - otherwise "mix" would mostly turn up a copy of the dry
+            # signal instead of the reverb. Later stages keep what they were
+            # handed (in_gain=1) and add their own taps on top.
+            in_gain = 0 if index == 0 else 1
+            target.append(f"aecho={in_gain}:1:{taps}:{decays}")
+        level /= echo_power_gain(stages)
     # afir normalises the impulse response itself, so the IR path needs no
     # correction of its own.
 
@@ -461,6 +524,32 @@ def build_reverb_send_filters(reverb: ReverbSettings) -> tuple[list[str], list[s
 
     target.append(f"volume={_fmt(level)}")
     return before, after
+
+
+def build_tone_filters(spec: FxSpec) -> list[str]:
+    """Bass and treble shelves, applied before the signal is split."""
+    filters: list[str] = []
+    if not _close(spec.bass_gain, 0.0):
+        filters.append(f"bass=g={_fmt(spec.bass_gain)}:f={_fmt(BASS_SHELF_HZ)}")
+    if not _close(spec.treble_gain, 0.0):
+        filters.append(f"treble=g={_fmt(spec.treble_gain)}:f={_fmt(TREBLE_SHELF_HZ)}")
+    return filters
+
+
+def build_master_filters(spec: FxSpec, sample_rate: int) -> list[str]:
+    """What runs on the finished mix: width, loudness, and the safety limiter."""
+    filters: list[str] = []
+    if not _close(spec.stereo_width, 1.0):
+        filters.append(f"extrastereo=m={_fmt(spec.stereo_width)}:c=0")
+    if spec.normalize:
+        filters.append(f"loudnorm=I={_fmt(LOUDNESS_TARGET)}:TP=-1.5:LRA=11")
+        # loudnorm runs its internals at 192 kHz and hands that on; without
+        # this the output file would silently be resampled up.
+        filters.append(f"aresample={sample_rate}")
+    if filters or spec.reverb is not None or spec.bass_gain > 0 or spec.treble_gain > 0:
+        # anything that can raise the level gets the limiter behind it
+        filters.append(f"alimiter=limit={_fmt(SAFETY_LIMIT)}:level=0:latency=1")
+    return filters
 
 
 def build_filter_chain(
@@ -489,19 +578,21 @@ def plan_filters(
     resampler: str | None = None,
 ) -> FilterPlan:
     """Build either a simple -filter:a chain or a full -filter_complex graph."""
-    time_pitch = build_time_pitch_filters(spec, sample_rate, engine, resampler)
+    head = build_time_pitch_filters(spec, sample_rate, engine, resampler)
+    head += build_tone_filters(spec)
+    master = build_master_filters(spec, sample_rate)
     reverb = spec.reverb
 
     if reverb is None:
-        chain = ",".join(time_pitch)
+        chain = ",".join(head + master)
         args = ["-map", "0:a:0"]
         if chain:
             args += ["-filter:a", chain]
         return FilterPlan(args=args, description=chain or "(no filters)")
 
     before_ir, after_ir = build_reverb_send_filters(reverb)
-    head = ",".join(time_pitch)
-    split = f"[0:a]{head + ',' if head else ''}asplit=2[dry][send]"
+    prefix = ",".join(head)
+    split = f"[0:a]{prefix + ',' if prefix else ''}asplit=2[dry][send]"
 
     parts = [split]
     if reverb.ir_file is None:
@@ -509,18 +600,17 @@ def plan_filters(
     else:
         pre = ",".join(before_ir)
         parts.append(f"[send]{pre}[ir_in]" if pre else "[send]anull[ir_in]")
-        # dry=0 keeps afir's own dry path silent - we do the mixing ourselves.
-        parts.append("[ir_in][1:a]afir=dry=0:wet=1[conv]")
+        # afir's `dry` is the gain on its *input*, not a dry/wet balance:
+        # dry=0 feeds it silence and the whole reverb disappears.
+        parts.append("[ir_in][1:a]afir=wet=1[conv]")
         parts.append(f"[conv]{','.join(after_ir)}[wet]")
 
     # normalize=0 keeps amix from rescaling. The trim gives the wet signal its
     # headroom back, and the limiter catches the rare peak that survives it -
     # together they are what stops the "boomy, clipped" reverb sound.
     trim = 1 / (1 + reverb.mix)
-    parts.append(
-        f"[dry][wet]amix=inputs=2:normalize=0,volume={_fmt(trim)},"
-        f"alimiter=limit={_fmt(SAFETY_LIMIT)}:level=0:latency=1[out]"
-    )
+    tail = ",".join([f"volume={_fmt(trim)}", *master])
+    parts.append(f"[dry][wet]amix=inputs=2:normalize=0,{tail}[out]")
 
     graph = ";".join(parts)
     args = ["-filter_complex", graph, "-map", "[out]"]

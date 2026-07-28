@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from audiofx import gui, theme
-from audiofx.ffmpeg_runner import REVERB_SIZES
+from audiofx.ffmpeg_runner import REVERB_ROOMS
 from conftest import duration_of, ffmpeg_required
 
 
@@ -18,7 +18,7 @@ def make_options(tmp_path: Path, **overrides) -> gui.JobOptions:
         factor=0.85,
         preserve_pitch=False,
         pitch_shift=0.0,
-        reverb_room="medium",
+        reverb_decay=REVERB_ROOMS["medium"],
         reverb_mix=0.35,
         reverb_bass_cut=200.0,
         quality="Same as source (high bitrate)",
@@ -39,15 +39,34 @@ def test_build_spec_slowed_reverb(tmp_path: Path):
     spec = make_options(tmp_path).build_spec()
     assert spec.tempo == pytest.approx(0.85)
     assert spec.reverb is not None
-    assert tuple(spec.reverb.delays) == REVERB_SIZES["medium"][0]
+    assert spec.reverb.decay == REVERB_ROOMS["medium"]
     assert spec.reverb.highpass == pytest.approx(200)
     spec.validate()
 
 
-def test_build_spec_room_size_changes_the_taps(tmp_path: Path):
-    spec = make_options(tmp_path, reverb_room="small").build_spec()
+def test_build_spec_room_size_changes_the_decay(tmp_path: Path):
+    spec = make_options(tmp_path, reverb_decay=REVERB_ROOMS["small"]).build_spec()
     assert spec.reverb is not None
-    assert tuple(spec.reverb.delays) == REVERB_SIZES["small"][0]
+    assert spec.reverb.decay == REVERB_ROOMS["small"]
+
+
+def test_build_spec_carries_the_tone_controls(tmp_path: Path):
+    spec = make_options(
+        tmp_path, bass=6, treble=-3, stereo_width=1.5, normalize=True
+    ).build_spec()
+    assert spec.bass_gain == 6
+    assert spec.treble_gain == -3
+    assert spec.stereo_width == 1.5
+    assert spec.normalize is True
+    spec.validate()
+
+
+def test_options_convert_into_a_saveable_preset(tmp_path: Path):
+    preset = make_options(tmp_path, bass=4).to_preset("mine", "note")
+    assert preset.name == "mine" and preset.bass == 4
+    assert preset.reverb is not None
+    # the round trip has to survive validation, or saving would write junk
+    preset.to_spec().validate()
 
 
 def test_build_spec_reverb_keeps_tempo(tmp_path: Path):
@@ -60,13 +79,6 @@ def test_build_spec_speed_has_no_reverb(tmp_path: Path):
     spec = make_options(tmp_path, mode="speed", factor=1.25).build_spec()
     assert spec.tempo == pytest.approx(1.25)
     assert spec.reverb is None
-
-
-def test_build_spec_uses_ir_for_the_hall(tmp_path: Path):
-    ir = tmp_path / "ir.wav"
-    ir.write_bytes(b"RIFF")
-    spec = make_options(tmp_path, mode="reverb", reverb_room="hall", ir_file=ir).build_spec()
-    assert spec.reverb is not None and spec.reverb.ir_file == ir
 
 
 def test_unique_path_avoids_overwrite(tmp_path: Path):
@@ -84,9 +96,9 @@ def test_speed_ranges_cover_every_mode():
         assert low <= high
 
 
-def test_room_choices_map_to_known_sizes():
+def test_room_choices_map_to_known_rooms():
     for key in gui.ROOM_CHOICES.values():
-        assert key == "hall" or key in REVERB_SIZES
+        assert key in REVERB_ROOMS
 
 
 def test_quality_choices_are_known_extensions():
@@ -162,18 +174,47 @@ def test_selecting_reverb_preset_fills_the_reverb_controls(app):
         pytest.skip("preset missing")
     app.preset_var.set("dreamy")
     app._apply_preset()
-    assert app.room_var.get() == "Large room"
+    assert app.room_var.get() == "Concert hall"
+    assert app.decay_var.get() == pytest.approx(REVERB_ROOMS["hall"])
     assert app.mix_var.get() == pytest.approx(0.5)
     assert app.bass_cut_var.get() == pytest.approx(240)
+    assert app.predelay_var.get() == pytest.approx(30)
+    assert app.width_var.get() == pytest.approx(1.4)
 
 
-def test_hall_preset_selects_the_ir_room(app):
-    if "reverb_hall" not in app.presets:  # pragma: no cover
-        pytest.skip("preset missing")
-    app.preset_var.set("reverb_hall")
-    app._apply_preset()
-    assert app.room_var.get() == "Concert hall (IR)"
-    assert app._current_options().reverb_room == "hall"
+def test_picking_a_room_moves_the_decay_slider(app):
+    app.room_var.set("Cathedral")
+    app._on_room_change()
+    assert app.decay_var.get() == pytest.approx(REVERB_ROOMS["cathedral"])
+    assert app._current_options().reverb_decay == pytest.approx(REVERB_ROOMS["cathedral"])
+
+
+def test_moving_the_decay_slider_by_hand_says_custom(app):
+    app.room_var.set("Small room")
+    app._on_room_change()
+    app.decay_var.set(3.7)
+    app._on_decay_change()
+    assert app.room_var.get() == gui.CUSTOM_ROOM
+    assert app.preset_var.get() == gui.CUSTOM_PRESET
+
+
+def test_reverb_controls_switch_off_without_reverb(app):
+    app.mode_var.set("slow")
+    app._on_mode_change()
+    assert all(str(w.cget("state")) == "disabled" for w in app._reverb_widgets)
+    app.mode_var.set("slowed_reverb")
+    app._on_mode_change()
+    assert all(str(w.cget("state")) != "disabled" for w in app._reverb_widgets)
+
+
+def test_reset_tone_puts_everything_back(app):
+    app.bass_var.set(8)
+    app.width_var.set(2.0)
+    app.normalize_var.set(True)
+    app.reset_tone()
+    options = app._current_options()
+    assert options.bass == 0 and options.stereo_width == 1.0
+    assert options.normalize is False
 
 
 def test_manual_change_switches_preset_to_custom(app):

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from audiofx import cli
-from audiofx.ffmpeg_runner import REVERB_SIZES
+from audiofx.ffmpeg_runner import REVERB_ROOMS, ReverbSettings
 from audiofx.presets import PresetError, load_presets, parse_preset
 from conftest import duration_of, ffmpeg_required
 
@@ -45,10 +45,15 @@ def test_shipped_reverb_presets_cut_the_bass():
             assert preset.reverb.highpass >= 150
 
 
-def test_preset_size_shortcut_picks_the_tap_layout():
-    preset = parse_preset("x", {"mode": "reverb", "reverb": {"size": "large"}})
+def test_preset_room_shortcut_picks_the_decay_time():
+    preset = parse_preset("x", {"mode": "reverb", "reverb": {"room": "large"}})
     assert preset.reverb is not None
-    assert tuple(preset.reverb.delays) == REVERB_SIZES["large"][0]
+    assert preset.reverb.decay == REVERB_ROOMS["large"]
+
+
+def test_preset_decay_overrides_the_room():
+    preset = parse_preset("x", {"mode": "reverb", "reverb": {"room": "small", "decay": 6}})
+    assert preset.reverb is not None and preset.reverb.decay == 6
 
 
 def test_preset_rejects_unknown_key():
@@ -63,12 +68,17 @@ def test_preset_rejects_bad_mode():
 
 def test_preset_rejects_bad_reverb():
     with pytest.raises(PresetError):
-        parse_preset("bad", {"mode": "reverb", "reverb": {"decays": 5, "delays": 50}})
+        parse_preset("bad", {"mode": "reverb", "reverb": {"decay": 500}})
 
 
-def test_preset_rejects_unknown_room_size():
+def test_preset_rejects_unknown_room():
     with pytest.raises(PresetError):
-        parse_preset("bad", {"mode": "reverb", "reverb": {"size": "cathedral"}})
+        parse_preset("bad", {"mode": "reverb", "reverb": {"room": "stadium"}})
+
+
+def test_preset_rejects_out_of_range_tone():
+    with pytest.raises(PresetError):
+        parse_preset("bad", {"mode": "slow", "factor": 0.9, "bass": 99})
 
 
 def test_presets_list_command(capsys):
@@ -149,7 +159,7 @@ def test_reverb_flags_override_preset_values():
             "x.mp3",
             "--mode",
             "reverb",
-            "--reverb-size",
+            "--reverb-room",
             "large",
             "--reverb-mix",
             "0.6",
@@ -160,17 +170,43 @@ def test_reverb_flags_override_preset_values():
         )
     )
     assert spec.reverb is not None
-    assert tuple(spec.reverb.delays) == REVERB_SIZES["large"][0]
+    assert spec.reverb.decay == REVERB_ROOMS["large"]
     assert spec.reverb.mix == pytest.approx(0.6)
     assert spec.reverb.highpass == pytest.approx(300)
     assert spec.reverb.lowpass == pytest.approx(5000)
 
 
-def test_reverb_size_flag_clears_a_preset_ir_file():
+def test_reverb_room_flag_clears_a_preset_ir_file():
     spec, _, _ = cli.resolve_spec(
-        parse("convert", "x.mp3", "--preset", "reverb_hall", "--reverb-size", "small")
+        parse("convert", "x.mp3", "--mode", "reverb", "--ir-file", "", "--reverb-room", "small")
     )
     assert spec.reverb is not None and spec.reverb.ir_file is None
+
+
+def test_reverb_decay_flag_overrides_the_room():
+    spec, _, _ = cli.resolve_spec(
+        parse("convert", "x.mp3", "--mode", "reverb", "--reverb-room", "small",
+              "--reverb-decay", "5", "--reverb-predelay", "45")
+    )
+    assert spec.reverb is not None
+    assert spec.reverb.decay == pytest.approx(5)
+    assert spec.reverb.predelay == pytest.approx(45)
+
+
+def test_tone_flags_reach_the_spec():
+    spec, _, _ = cli.resolve_spec(
+        parse("convert", "x.mp3", "--mode", "slow", "--factor", "0.9",
+              "--bass", "6", "--treble", "-3", "--stereo-width", "1.5", "--normalize")
+    )
+    assert spec.bass_gain == pytest.approx(6)
+    assert spec.treble_gain == pytest.approx(-3)
+    assert spec.stereo_width == pytest.approx(1.5)
+    assert spec.normalize is True
+
+
+def test_preset_supplies_the_tone_when_no_flag_is_given():
+    spec, _, _ = cli.resolve_spec(parse("convert", "x.mp3", "--preset", "bass_boosted"))
+    assert spec.bass_gain > 0 and spec.normalize is True
 
 
 def test_invalid_reverb_mix_is_rejected():
@@ -220,8 +256,9 @@ def test_convert_command_creates_output(workdir: Path, tmp_path: Path, capsys):
     assert code == 0
     produced = out_dir / "song_slowed_reverb_default.wav"
     assert produced.is_file()
-    # 154 ms of reverb tail on top of the slowed length
-    assert duration_of(produced) == pytest.approx(2 / 0.85 + 0.154, rel=0.03)
+    # the reverb tail adds one decay time on top of the slowed length
+    expected = 2 / 0.85 + ReverbSettings().tail_ms / 1000
+    assert duration_of(produced) == pytest.approx(expected, rel=0.03)
     assert "Done." in capsys.readouterr().out
 
 

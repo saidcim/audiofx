@@ -7,13 +7,18 @@
 #   pitch_shift    : pitch offset in semitones (e.g. -2, +3.5)
 #   preserve_pitch : true keeps the pitch while the tempo changes
 #   engine         : auto | classic | rubberband
-#   reverb         : size / delays / decays / mix / highpass / lowpass / ir_file
+#   bass           : low shelf in dB (+6 is a firm boost, -6 thins it out)
+#   treble         : high shelf in dB
+#   stereo_width   : 1.0 leaves the image alone, 1.5 widens, 0 collapses to mono
+#   normalize      : true brings the loudness to about -14 LUFS
+#   reverb         : room / decay / predelay / mix / highpass / lowpass / ir_file
 #
 # About the reverb block:
-#   size     small | medium | large - picks a ready-made tap layout
-#   delays   tap delays in ms (overrides `size`); 4+ taps are split into two
-#            chained aecho stages, which multiply into a denser tail
-#   decays   gain of each tap, 0-1, same length as delays
+#   room     small | medium | large | hall | cathedral - each is a decay time
+#   decay    seconds for the tail to fall 60 dB (overrides `room`). This is the
+#            one number that separates a small room from a cathedral.
+#   predelay ms of silence before the tail starts; a longer gap reads as a
+#            bigger room and keeps the tail off the vocal transient
 #   mix      how much of the tail is mixed back in (0.35 = subtle, 0.6 = wet)
 #   highpass Hz below which the tail is removed. This is what keeps the result
 #            from sounding bass-boosted: low frequencies stay in the dry signal
@@ -29,7 +34,7 @@ presets:
     mode: slowed_reverb
     factor: 0.85
     reverb:
-      size: medium
+      room: medium
       mix: 0.35
       highpass: 200
       lowpass: 7000
@@ -48,11 +53,25 @@ presets:
     description: "Heavy slowdown plus a long, wide reverb tail"
     mode: slowed_reverb
     factor: 0.8
+    stereo_width: 1.4
     reverb:
-      size: large
+      room: hall
+      predelay: 30
       mix: 0.5
       highpass: 240
       lowpass: 6000
+
+  cathedral:
+    description: "Very slow, enormous tail - the whole track turns into a pad"
+    mode: slowed_reverb
+    factor: 0.7
+    stereo_width: 1.6
+    reverb:
+      room: cathedral
+      predelay: 60
+      mix: 0.6
+      highpass: 260
+      lowpass: 5000
 
   nightcore:
     description: "Sped up and pitched up (nightcore)"
@@ -65,22 +84,47 @@ presets:
     factor: 1.15
     preserve_pitch: true
 
+  bass_boosted:
+    description: "Slowed with a firm low shelf, levelled off afterwards"
+    mode: slowed_reverb
+    factor: 0.88
+    bass: 6
+    normalize: true
+    reverb:
+      room: small
+      mix: 0.22
+      highpass: 220
+      lowpass: 7000
+
+  lofi:
+    description: "Slowed, dulled highs and a small room - tape-ish"
+    mode: slowed_reverb
+    factor: 0.82
+    treble: -6
+    bass: 3
+    reverb:
+      room: small
+      mix: 0.3
+      highpass: 200
+      lowpass: 4500
+
   reverb_room:
     description: "Small room reverb, tempo untouched"
     mode: reverb
     factor: 1.0
     reverb:
-      size: small
+      room: small
       mix: 0.28
       highpass: 180
       lowpass: 8000
 
   reverb_hall:
-    description: "Large hall via IR convolution (afir)"
+    description: "Concert hall reverb, tempo untouched"
     mode: reverb
     factor: 1.0
     reverb:
-      ir_file: assets/ir/hall_large.wav
+      room: hall
+      predelay: 40
       mix: 0.35
       highpass: 220
       lowpass: 7000
