@@ -69,6 +69,11 @@ LIGHT = Palette(
 SYSTEM = "system"
 DEFAULT_THEME = "dark"
 
+# The palettes are painted onto a private clone of clam rather than onto clam
+# itself: on Linux clam *is* the platform theme, so configuring it would leave
+# the dark colours behind for anyone who then picks "System default".
+THEME_NAME = "audiofx"
+
 PALETTES: dict[str, Palette] = {DARK.name: DARK, LIGHT.name: LIGHT}
 
 # value -> menu label
@@ -109,6 +114,16 @@ def _native_theme(style: ttk.Style) -> str:
         if candidate in names:
             return candidate
     return style.theme_use()  # pragma: no cover - exotic Tk build
+
+
+def _use_own_theme(style: ttk.Style) -> None:
+    """Switch to our clone of clam, creating it the first time."""
+    try:
+        if THEME_NAME not in style.theme_names():
+            style.theme_create(THEME_NAME, parent="clam", settings={})
+        style.theme_use(THEME_NAME)
+    except tk.TclError:  # pragma: no cover - clam always ships with Tk
+        style.theme_use("clam")
 
 
 def _configure(style: ttk.Style, p: Palette) -> None:
@@ -286,10 +301,7 @@ def apply_theme(widget: tk.Misc, name: str) -> Palette:
         if native_bg:
             palette = replace(palette, window=native_bg, surface=native_bg)
     else:
-        try:
-            style.theme_use("clam")
-        except tk.TclError:  # pragma: no cover - clam always ships with Tk
-            pass
+        _use_own_theme(style)
         _configure(style, palette)
 
     _configure_named(style, palette)

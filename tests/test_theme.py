@@ -77,12 +77,24 @@ def test_apply_theme_paints_the_window(frame):
     assert frame.winfo_toplevel().cget("background") == theme.DARK.window
 
 
-def test_apply_theme_uses_clam_for_the_bundled_palettes(frame):
+def test_apply_theme_uses_its_own_theme_for_the_bundled_palettes(frame):
     from tkinter import ttk
 
     theme.apply_theme(frame, "light")
-    assert ttk.Style(frame).theme_use() == "clam"
+    assert ttk.Style(frame).theme_use() == theme.THEME_NAME
     assert ttk.Style(frame).lookup("TLabel", "foreground") == theme.LIGHT.text
+
+
+def test_the_system_theme_is_not_stained_by_the_dark_palette(frame):
+    """On Linux the platform theme is clam, the very theme clam-based palettes
+    would otherwise overwrite - so "System default" must not come back dark."""
+    from tkinter import ttk
+
+    theme.apply_theme(frame, "dark")
+    theme.apply_theme(frame, theme.SYSTEM)
+    style = ttk.Style(frame)
+    assert style.theme_use() != theme.THEME_NAME
+    assert style.lookup("TFrame", "background") != theme.DARK.window
 
 
 def test_switching_back_and_forth_keeps_the_colours_consistent(frame):
